@@ -1,0 +1,418 @@
+import os
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+from torchvision import transforms
+from PIL import Image
+import random
+import torchvision.transforms.functional as TF
+
+
+class IrradianceForecastDataset(Dataset):
+    def __init__(
+        self,
+        csv_path: str,
+        split: str = "train",
+        val_ratio: float = 0.2,
+        test_ratio: float = 0.0,
+        img_seq_len: int = 5,
+        ts_seq_len: int = 30,
+        horizon: int = 20,
+        feature_cols=None,
+        target_cols=None,
+        img_size: int = 224,
+        time_col: str = "timestamp",
+        normalization_stats: dict = None,
+        root_dir: str = "",
+        mask_mode: str = "real",
+        apply_rotation: bool = True,
+    ):
+        """
+        Dataset for solar irradiance forecasting.
+
+        Inputs:
+            RGB sky image sequence:
+                shape = (T_img, 3, H, W)
+
+            Cloud mask sequence:
+                shape = (T_img, 1, H, W)
+                white = cloud = 1
+                black = sky   = 0
+
+            Time-series sequence:
+                shape = (T_ts, 3)
+                features = ghi, dni, dhi
+
+        Target:
+            Future GHI sequence:
+                shape = (horizon, 1)
+
+        mask_mode:
+            "real" -> load real cloud mask
+            "zero" -> return zero mask for without-cloud-mask experiment
+        """
+
+        # -------------------------------
+        # Load full dataset
+        # -------------------------------
+        df = pd.read_csv(csv_path)
+
+        if time_col in df.columns:
+            df[time_col] = pd.to_datetime(df[time_col])
+            df = df.sort_values(time_col).reset_index(drop=True)
+
+        n = len(df)
+
+        # -------------------------------
+        # Train / validation / test split
+        # -------------------------------
+        if test_ratio > 0:
+            train_end = int(n * (1.0 - val_ratio - test_ratio))
+            val_end = int(n * (1.0 - test_ratio))
+
+            if split == "train":
+                self.df = df.iloc[:train_end].reset_index(drop=True)
+            elif split == "val":
+                self.df = df.iloc[train_end:val_end].reset_index(drop=True)
+            elif split == "test":
+                self.df = df.iloc[val_end:].reset_index(drop=True)
+            else:
+                raise ValueError("split must be 'train', 'val', or 'test'")
+        else:
+            split_idx = int(n * (1.0 - val_ratio))
+
+            if split == "train":
+                self.df = df.iloc[:split_idx].reset_index(drop=True)
+            elif split == "val":
+                self.df = df.iloc[split_idx:].reset_index(drop=True)
+            else:
+                raise ValueError("split must be 'train' or 'val' when test_ratio=0")
+
+        # -------------------------------
+        # Configuration
+        # -------------------------------
+        self.split = split
+        self.img_seq_len = img_seq_len
+        self.ts_seq_len = ts_seq_len
+        self.horizon = horizon
+        self.img_size = img_size
+        self.time_col = time_col
+        self.root_dir = root_dir
+        self.mask_mode = mask_mode
+        self.apply_rotation = apply_rotation
+
+        self.feature_cols = feature_cols or ["ghi", "dni", "dhi"]
+        self.target_cols = target_cols or ["ghi"]
+
+        # Image path columns
+        self.sky_col = "raw_image_path"
+        self.mask_col = "cloud_mask_image_path"
+
+        self.max_lookback = max(img_seq_len, ts_seq_len)
+
+        if self.mask_mode not in ["real", "zero"]:
+            raise ValueError("mask_mode must be either 'real' or 'zero'")
+
+        # -------------------------------
+        # Check required columns
+        # -------------------------------
+        required_cols = [self.sky_col, self.mask_col, self.time_col] + self.feature_cols + self.target_cols
+
+        missing_cols = [c for c in required_cols if c not in self.df.columns]
+        if missing_cols:
+            raise ValueError(f"Missing columns in CSV: {missing_cols}")
+
+        # -------------------------------
+        # Feature normalization
+        # Only normalize input features: ghi, dni, dhi
+        # Target GHI remains in original W/m² scale.
+        # -------------------------------
+        if split == "train":
+            mean = self.df[self.feature_cols].mean()
+            std = self.df[self.feature_cols].std()
+
+            # Avoid division by zero if any column is constant.
+            std = std.replace(0, 1.0)
+
+            self.normalization_stats = {
+                "mean": mean,
+                "std": std,
+            }
+        else:
+            if normalization_stats is None:
+                raise ValueError(
+                    "Validation/test split requires normalization_stats from the train dataset"
+                )
+
+            self.normalization_stats = normalization_stats
+            mean = normalization_stats["mean"]
+            std = normalization_stats["std"]
+
+        self.df[self.feature_cols] = (self.df[self.feature_cols] - mean) / std
+
+        # -------------------------------
+        # Image preprocessing
+        # -------------------------------
+        self.img_resize = transforms.Resize((img_size, img_size))
+        self.mask_resize = transforms.Resize(
+            (img_size, img_size),
+            interpolation=TF.InterpolationMode.NEAREST,
+        )
+
+        self.img_normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        )
+
+        # -------------------------------
+        # Logging
+        # -------------------------------
+        print(f"\nDataset initialized ({split.upper()}): {len(self)} samples")
+        print(f"CSV path: {csv_path}")
+        print(f"Image sequence length: {img_seq_len}")
+        print(f"Time-series length: {ts_seq_len}")
+        print(f"Forecast horizon: {horizon}")
+        print(f"Time-series features: {self.feature_cols}")
+        print(f"Target columns: {self.target_cols}")
+        print(f"Mask mode: {self.mask_mode}")
+        print("Mask convention: white = cloud = 1, black = sky = 0")
+
+    def __len__(self):
+        return len(self.df) - self.max_lookback - self.horizon
+
+    def _resolve_path(self, path_value):
+        """
+        Handles both absolute paths and paths relative to root_dir.
+        """
+        path_value = str(path_value)
+
+        if os.path.isabs(path_value):
+            return path_value
+
+        return os.path.join(self.root_dir, path_value)
+
+    def _load_rgb_image(self, path):
+        """
+        Loads and preprocesses an RGB sky image.
+        """
+        img = Image.open(path).convert("RGB")
+        img = self.img_resize(img)
+        return img
+
+    def _load_cloud_mask(self, path):
+        """
+        Loads cloud mask.
+
+        Important:
+            white = cloud = 1
+            black = sky   = 0
+
+        The mask is loaded as grayscale, resized using nearest-neighbor,
+        and converted into a binary tensor.
+        """
+        mask = Image.open(path).convert("L")
+        mask = self.mask_resize(mask)
+        return mask
+
+    def __getitem__(self, idx):
+        # -------------------------------
+        # Select windows
+        # -------------------------------
+        img_window = self.df.iloc[
+            idx + self.ts_seq_len - self.img_seq_len : idx + self.ts_seq_len
+        ]
+
+        ts_window = self.df.iloc[
+            idx : idx + self.ts_seq_len
+        ]
+
+        target_window = self.df.iloc[
+            idx + self.ts_seq_len : idx + self.ts_seq_len + self.horizon
+        ]
+
+        # -------------------------------
+        # One random rotation per sequence
+        # Same rotation is applied to RGB and mask.
+        # Mask uses nearest-neighbor interpolation.
+        # -------------------------------
+        if self.split == "train" and self.apply_rotation:
+            angle = random.uniform(-180, 180)
+        else:
+            angle = 0.0
+
+        rgb_seq = []
+        mask_seq = []
+
+        for sky_p, mask_p in zip(
+            img_window[self.sky_col].values,
+            img_window[self.mask_col].values,
+        ):
+            sky_path = self._resolve_path(sky_p)
+            mask_path = self._resolve_path(mask_p)
+
+            # ---- Load RGB sky image ----
+            sky_img = self._load_rgb_image(sky_path)
+
+            # ---- Load cloud mask ----
+            cloud_mask = self._load_cloud_mask(mask_path)
+
+            # ---- Shared augmentation ----
+            if angle != 0.0:
+                sky_img = TF.rotate(
+                    sky_img,
+                    angle=angle,
+                    interpolation=TF.InterpolationMode.BILINEAR,
+                    fill=0,
+                )
+
+                cloud_mask = TF.rotate(
+                    cloud_mask,
+                    angle=angle,
+                    interpolation=TF.InterpolationMode.NEAREST,
+                    fill=0,
+                )
+
+            # ---- RGB to tensor and normalize ----
+            sky_tensor = TF.to_tensor(sky_img)
+            sky_tensor = self.img_normalize(sky_tensor)
+
+            # ---- Mask to tensor ----
+            if self.mask_mode == "real":
+                mask_tensor = TF.to_tensor(cloud_mask)
+
+                # Convert possible 0-255 mask into binary 0/1.
+                # Since white = cloud, no inversion is applied.
+                mask_tensor = (mask_tensor > 0.5).float()
+            else:
+                # Without-cloud-mask experiment.
+                # Same tensor shape, but contains no cloud information.
+                mask_tensor = torch.zeros(
+                    1,
+                    self.img_size,
+                    self.img_size,
+                    dtype=torch.float32,
+                )
+
+            rgb_seq.append(sky_tensor)
+            mask_seq.append(mask_tensor)
+
+        rgb_seq = torch.stack(rgb_seq)      # (T_img, 3, H, W)
+        mask_seq = torch.stack(mask_seq)    # (T_img, 1, H, W)
+
+        # -------------------------------
+        # Time-series inputs
+        # Only GHI, DNI, DHI are used.
+        # -------------------------------
+        ts_seq = torch.tensor(
+            ts_window[self.feature_cols].values,
+            dtype=torch.float32,
+        )  # (T_ts, 3)
+
+        # -------------------------------
+        # Target sequence
+        # Future GHI values for 20 minutes.
+        # -------------------------------
+        target_seq = torch.tensor(
+            target_window[self.target_cols].values,
+            dtype=torch.float32,
+        )  # (horizon, 1)
+
+        # -------------------------------
+        # Timestamps
+        # -------------------------------
+        if self.time_col in self.df.columns:
+            ts_time = (
+                ts_window[self.time_col]
+                .dt.floor("s")
+                .astype(str)
+                .tolist()
+            )
+
+            tgt_time = (
+                target_window[self.time_col]
+                .dt.floor("s")
+                .astype(str)
+                .tolist()
+            )
+        else:
+            ts_time = []
+            tgt_time = []
+
+        return rgb_seq, mask_seq, ts_seq, target_seq, ts_time, tgt_time
+
+
+# ======================================================================
+# Debug / Visualization
+# ======================================================================
+if __name__ == "__main__":
+    import matplotlib.pyplot as plt
+
+    CSV_PATH = "dataset_full_1M.csv"
+
+    train_dataset = IrradianceForecastDataset(
+        csv_path=CSV_PATH,
+        split="train",
+        val_ratio=0.2,
+        test_ratio=0.0,
+        img_seq_len=5,
+        ts_seq_len=30,
+        horizon=20,
+        feature_cols=["ghi", "dni", "dhi"],
+        target_cols=["ghi"],
+        img_size=224,
+        root_dir="",
+        mask_mode="real",
+    )
+
+    val_dataset = IrradianceForecastDataset(
+        csv_path=CSV_PATH,
+        split="val",
+        val_ratio=0.2,
+        test_ratio=0.0,
+        img_seq_len=5,
+        ts_seq_len=30,
+        horizon=20,
+        feature_cols=["ghi", "dni", "dhi"],
+        target_cols=["ghi"],
+        img_size=224,
+        root_dir="",
+        mask_mode="real",
+        normalization_stats=train_dataset.normalization_stats,
+    )
+
+    rgb_seq, mask_seq, ts_seq, target_seq, ts_time, tgt_time = train_dataset[2800]
+
+    print("RGB sequence shape:", rgb_seq.shape)          # (T_img, 3, H, W)
+    print("Mask sequence shape:", mask_seq.shape)        # (T_img, 1, H, W)
+    print("TS sequence shape:", ts_seq.shape)            # (T_ts, 3)
+    print("Target sequence shape:", target_seq.shape)    # (20, 1)
+
+    print("\nFirst TS timestamp:", ts_time[0])
+    print("Last TS timestamp:", ts_time[-1])
+    print("First target timestamp:", tgt_time[0])
+    print("Last target timestamp:", tgt_time[-1])
+
+    # -------------------------------
+    # Visualize RGB and cloud mask
+    # -------------------------------
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+    T = rgb_seq.shape[0]
+    fig, axes = plt.subplots(2, T, figsize=(3 * T, 6))
+
+    for i in range(T):
+        rgb = rgb_seq[i]
+        rgb_denorm = (rgb * std + mean).clamp(0, 1)
+
+        axes[0, i].imshow(rgb_denorm.permute(1, 2, 0))
+        axes[0, i].set_title("RGB")
+        axes[0, i].axis("off")
+
+        mask = mask_seq[i, 0]
+        axes[1, i].imshow(mask, cmap="gray", vmin=0, vmax=1)
+        axes[1, i].set_title("Cloud Mask")
+        axes[1, i].axis("off")
+
+    plt.tight_layout()
+    plt.show()
