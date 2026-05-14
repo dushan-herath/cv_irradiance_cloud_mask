@@ -34,12 +34,12 @@ ROOT_DIR = ""
 # -------------------------------
 # "real" -> with cloud segmentation mask
 # "zero" -> without cloud segmentation mask
-MASK_MODE = "real"
+MASK_MODE = "zero"
 
 # Recommended output directories:
 # With mask    -> "runs/with_cloud_mask"
 # Without mask -> "runs/without_cloud_mask"
-OUTPUT_DIR = "runs/with_cloud_mask"
+OUTPUT_DIR = "runs/without_cloud_mask"
 
 # -------------------------------
 # Dataset split

@@ -33,12 +33,12 @@ ROOT_DIR = ""
 #
 # "real" -> evaluate model trained WITH cloud segmentation mask
 # "zero" -> evaluate model trained WITHOUT cloud segmentation mask
-MASK_MODE = "real"
+MASK_MODE = "zero"
 
 # Must match the folder used during training.
 # With mask    -> "runs/with_cloud_mask"
 # Without mask -> "runs/without_cloud_mask"
-OUTPUT_DIR = "runs/with_cloud_mask"
+OUTPUT_DIR = "runs/without_cloud_mask"
 
 # -------------------------------
 # Checkpoint to evaluate
