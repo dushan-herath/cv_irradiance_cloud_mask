@@ -34,7 +34,7 @@ ROOT_DIR = ""
 # -------------------------------
 # "real" -> with cloud segmentation mask
 # "zero" -> without cloud segmentation mask
-MASK_MODE = "zero"
+MASK_MODE = "real"
 
 # Recommended output directories:
 # With mask    -> "runs/with_cloud_mask"

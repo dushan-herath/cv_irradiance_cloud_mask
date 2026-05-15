@@ -33,7 +33,7 @@ ROOT_DIR = ""
 #
 # "real" -> evaluate model trained WITH cloud segmentation mask
 # "zero" -> evaluate model trained WITHOUT cloud segmentation mask
-MASK_MODE = "zero"
+MASK_MODE = "real"
 
 # Must match the folder used during training.
 # With mask    -> "runs/with_cloud_mask"
