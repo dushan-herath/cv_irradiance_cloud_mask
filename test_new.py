@@ -189,6 +189,22 @@ def load_norm_stats(path):
     }
 
 
+def inverse_normalize_ghi(values, norm_stats):
+    """
+    Converts normalized GHI values back to original W/m² scale.
+
+    values:
+        numpy array with shape (N, horizon, 1)
+
+    norm_stats:
+        dictionary containing mean and std for GHI
+    """
+    ghi_mean = float(norm_stats["mean"]["ghi"])
+    ghi_std = float(norm_stats["std"]["ghi"])
+
+    return values * ghi_std + ghi_mean
+
+
 # ============================================================
 # Metrics
 # ============================================================
@@ -350,6 +366,7 @@ def evaluate_split(
     device,
     use_cloud_mask,
     split_name,
+    norm_stats=None,
     save_predictions_path=None,
 ):
     model.eval()
@@ -448,10 +465,26 @@ def evaluate_split(
 
     per_horizon_rows = compute_per_horizon_metrics(all_preds, all_targets)
 
+    if norm_stats is not None:
+        all_preds_unnorm = inverse_normalize_ghi(all_preds, norm_stats)
+        all_targets_unnorm = inverse_normalize_ghi(all_targets, norm_stats)
+
+        overall_metrics_unnorm = compute_forecasting_metrics(
+            all_preds_unnorm,
+            all_targets_unnorm,
+        )
+
+        overall_metrics_unnorm["num_samples"] = int(all_preds_unnorm.shape[0])
+        overall_metrics_unnorm["num_forecast_points"] = int(
+            all_preds_unnorm.shape[0] * all_preds_unnorm.shape[1]
+        )
+    else:
+        overall_metrics_unnorm = None
+
     if save_predictions_path is not None:
         save_dict_rows_csv(prediction_rows, save_predictions_path)
 
-    return overall_metrics, per_horizon_rows
+    return overall_metrics, per_horizon_rows, overall_metrics_unnorm
 
 
 # ============================================================
@@ -623,10 +656,20 @@ def main():
     # -------------------------------
     norm_stats = load_norm_stats(NORM_STATS_PATH)
 
+    if norm_stats is not None:
+        print(f"GHI mean for inverse normalization: {float(norm_stats['mean']['ghi']):.5f}")
+        print(f"GHI std for inverse normalization: {float(norm_stats['std']['ghi']):.5f}")
+
     # -------------------------------
     # Build datasets
     # -------------------------------
     datasets = build_datasets(norm_stats)
+
+    if norm_stats is None:
+        norm_stats = datasets["train"].normalization_stats
+        print("Using train dataset normalization stats for inverse normalization.")
+        print(f"GHI mean for inverse normalization: {float(norm_stats['mean']['ghi']):.5f}")
+        print(f"GHI std for inverse normalization: {float(norm_stats['std']['ghi']):.5f}")
 
     # -------------------------------
     # DataLoaders
@@ -671,6 +714,8 @@ def main():
     # Evaluate all splits
     # -------------------------------
     summary_rows = []
+    summary_rows_unnorm = []
+
     all_results = {
         "experiment": "with_cloud_mask" if use_cloud_mask else "without_cloud_mask",
         "mask_mode": MASK_MODE,
@@ -701,17 +746,18 @@ def main():
                 f"predictions_{split_name}.csv",
             )
 
-        metrics, per_horizon_rows = evaluate_split(
+        metrics, per_horizon_rows, metrics_unnorm = evaluate_split(
             model=model,
             loader=loader,
             device=device,
             use_cloud_mask=use_cloud_mask,
             split_name=split_name,
+            norm_stats=norm_stats,
             save_predictions_path=prediction_path,
         )
 
         print(
-            f"{split_name.upper()} | "
+            f"{split_name.upper()} NORMALIZED | "
             f"Samples: {metrics['num_samples']} | "
             f"Loss: {metrics['loss']:.5f} | "
             f"RMSE: {metrics['rmse']:.3f} | "
@@ -719,6 +765,17 @@ def main():
             f"MBE: {metrics['mbe']:.3f} | "
             f"R2: {metrics['r2']:.4f}"
         )
+
+        if metrics_unnorm is not None:
+            print(
+                f"{split_name.upper()} UNNORMALIZED | "
+                f"Samples: {metrics_unnorm['num_samples']} | "
+                f"MSE: {metrics_unnorm['mse']:.3f} | "
+                f"RMSE: {metrics_unnorm['rmse']:.3f} W/m² | "
+                f"MAE: {metrics_unnorm['mae']:.3f} W/m² | "
+                f"MBE: {metrics_unnorm['mbe']:.3f} W/m² | "
+                f"R2: {metrics_unnorm['r2']:.4f}"
+            )
 
         summary_row = {
             "split": split_name,
@@ -734,6 +791,20 @@ def main():
 
         summary_rows.append(summary_row)
 
+        if metrics_unnorm is not None:
+            summary_row_unnorm = {
+                "split": split_name,
+                "num_samples": metrics_unnorm["num_samples"],
+                "num_forecast_points": metrics_unnorm["num_forecast_points"],
+                "mse": metrics_unnorm["mse"],
+                "rmse": metrics_unnorm["rmse"],
+                "mae": metrics_unnorm["mae"],
+                "mbe": metrics_unnorm["mbe"],
+                "r2": metrics_unnorm["r2"],
+            }
+
+            summary_rows_unnorm.append(summary_row_unnorm)
+
         per_horizon_path = os.path.join(
             EVAL_OUTPUT_DIR,
             f"per_horizon_metrics_{split_name}.csv",
@@ -746,6 +817,7 @@ def main():
 
         all_results["splits"][split_name] = {
             "overall_metrics": metrics,
+            "overall_metrics_unnormalized": metrics_unnorm,
             "per_horizon_metrics": per_horizon_rows,
             "predictions_csv": prediction_path,
         }
@@ -760,9 +832,9 @@ def main():
     save_json(all_results, summary_json_path)
 
     # -------------------------------
-    # Print final table
+    # Print final normalized table
     # -------------------------------
-    print("\n================ EVALUATION SUMMARY ================")
+    print("\n================ NORMALIZED EVALUATION SUMMARY ================")
     print(
         f"{'split':<10} "
         f"{'samples':>10} "
@@ -778,6 +850,32 @@ def main():
             f"{row['split']:<10} "
             f"{row['num_samples']:>10} "
             f"{row['loss']:>12.5f} "
+            f"{row['rmse']:>12.3f} "
+            f"{row['mae']:>12.3f} "
+            f"{row['mbe']:>12.3f} "
+            f"{row['r2']:>10.4f}"
+        )
+
+    # -------------------------------
+    # Print final unnormalized table
+    # -------------------------------
+    print("\n================ UNNORMALIZED EVALUATION SUMMARY ================")
+    print("Units: RMSE, MAE, and MBE are in W/m². MSE is in (W/m²)².")
+    print(
+        f"{'split':<10} "
+        f"{'samples':>10} "
+        f"{'mse':>12} "
+        f"{'rmse':>12} "
+        f"{'mae':>12} "
+        f"{'mbe':>12} "
+        f"{'r2':>10}"
+    )
+
+    for row in summary_rows_unnorm:
+        print(
+            f"{row['split']:<10} "
+            f"{row['num_samples']:>10} "
+            f"{row['mse']:>12.3f} "
             f"{row['rmse']:>12.3f} "
             f"{row['mae']:>12.3f} "
             f"{row['mbe']:>12.3f} "
