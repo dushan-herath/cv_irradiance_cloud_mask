@@ -85,7 +85,7 @@ TARGET_DIM = 1
 # -------------------------------
 # Training settings
 # -------------------------------
-BATCH_SIZE = 32
+BATCH_SIZE = 128
 NUM_EPOCHS = 50
 NUM_WORKERS = 4
 

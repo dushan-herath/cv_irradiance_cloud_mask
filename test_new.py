@@ -103,7 +103,7 @@ TARGET_DIM = 1
 # -------------------------------
 # Evaluation settings
 # -------------------------------
-BATCH_SIZE = 32
+BATCH_SIZE = 128
 NUM_WORKERS = 4
 SEED = 42
 
