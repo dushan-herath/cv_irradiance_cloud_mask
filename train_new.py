@@ -76,7 +76,7 @@ IMG_SIZE = 224
 # -------------------------------
 VISION_MODEL_NAME = "vit_tiny_patch16_224"
 PRETRAINED = True
-FREEZE_VISION = True
+FREEZE_VISION = False
 
 D_MODEL = 128
 FUSED_DIM = 128
@@ -85,7 +85,7 @@ TARGET_DIM = 1
 # -------------------------------
 # Training settings
 # -------------------------------
-BATCH_SIZE = 128
+BATCH_SIZE = 32
 NUM_EPOCHS = 50
 NUM_WORKERS = 4
 
