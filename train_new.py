@@ -85,7 +85,7 @@ TARGET_DIM = 1
 # -------------------------------
 # Training settings
 # -------------------------------
-BATCH_SIZE = 8
+BATCH_SIZE = 32
 NUM_EPOCHS = 50
 NUM_WORKERS = 4
 
@@ -102,7 +102,7 @@ RESUME = False
 # -------------------------------
 # Augmentation
 # -------------------------------
-APPLY_ROTATION = True
+APPLY_ROTATION = False
 
 # -------------------------------
 # Saved file names
