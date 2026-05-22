@@ -31,14 +31,14 @@ ROOT_DIR = ""
 # -------------------------------
 # Use the same mode as the model you trained.
 #
-# "real" -> evaluate model trained WITH cloud segmentation mask
-# "zero" -> evaluate model trained WITHOUT cloud segmentation mask
+# "real" -> evaluate cloud-mask-only model
+# "zero" -> evaluate zero-mask baseline
 MASK_MODE = "real"
 
 # Must match the folder used during training.
-# With mask    -> "runs/with_cloud_mask"
-# Without mask -> "runs/without_cloud_mask"
-OUTPUT_DIR = "runs/without_cloud_mask"
+# Mask only -> "runs/cloud_mask_only"
+# Zero mask -> "runs/zero_mask_baseline"
+OUTPUT_DIR = "runs/cloud_mask_only"
 
 # -------------------------------
 # Checkpoint to evaluate
@@ -76,20 +76,23 @@ FEATURE_COLS = ["ghi", "dni", "dhi"]
 TARGET_COLS = ["ghi"]
 
 # -------------------------------
-# Image settings
+# Cloud-mask image settings
 # Must match training.
 # -------------------------------
 IMG_SIZE = 224
 
 # Mask convention:
-# white = cloud = 1
-# black = sky   = 0
+# R = low cloud
+# G = mid cloud
+# B = high cloud
+# black = sky
 
 # -------------------------------
 # Model settings
 # Must match training.
 # -------------------------------
 VISION_MODEL_NAME = "vit_tiny_patch16_224"
+MASK_IN_CHANS = 3
 
 # During evaluation we do not need to load ImageNet weights,
 # because we load your trained checkpoint.
@@ -192,6 +195,10 @@ def load_norm_stats(path):
 def inverse_normalize_ghi(values, norm_stats):
     """
     Converts normalized GHI values back to original W/m² scale.
+
+    The current dataset leaves target GHI unnormalized, so evaluation does not
+    call this helper. It is kept only for older checkpoints/datasets that may
+    have normalized targets.
 
     values:
         numpy array with shape (N, horizon, 1)
@@ -386,22 +393,20 @@ def evaluate_split(
 
     with torch.no_grad():
         for batch in loop:
-            rgb_seq, mask_seq, ts_seq, targets, ts_time, tgt_time = batch
+            mask_seq, ts_seq, targets, ts_time, tgt_time = batch
 
-            rgb_seq = rgb_seq.to(device, non_blocking=True)
             mask_seq = mask_seq.to(device, non_blocking=True)
             ts_seq = ts_seq.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
-            batch_size = rgb_seq.size(0)
+            batch_size = mask_seq.size(0)
 
             use_amp_now = device.type == "cuda" and USE_AMP
 
             with torch.cuda.amp.autocast(enabled=use_amp_now):
                 preds = model(
-                    rgb=rgb_seq,
-                    ts=ts_seq,
                     cloud_mask=mask_seq,
+                    ts=ts_seq,
                     use_cloud_mask=use_cloud_mask,
                 )
 
@@ -465,21 +470,9 @@ def evaluate_split(
 
     per_horizon_rows = compute_per_horizon_metrics(all_preds, all_targets)
 
-    if norm_stats is not None:
-        all_preds_unnorm = inverse_normalize_ghi(all_preds, norm_stats)
-        all_targets_unnorm = inverse_normalize_ghi(all_targets, norm_stats)
-
-        overall_metrics_unnorm = compute_forecasting_metrics(
-            all_preds_unnorm,
-            all_targets_unnorm,
-        )
-
-        overall_metrics_unnorm["num_samples"] = int(all_preds_unnorm.shape[0])
-        overall_metrics_unnorm["num_forecast_points"] = int(
-            all_preds_unnorm.shape[0] * all_preds_unnorm.shape[1]
-        )
-    else:
-        overall_metrics_unnorm = None
+    # Targets are already kept in original W/m^2 scale by dataset_new.py, so
+    # the metrics above are the final physical-scale metrics.
+    overall_metrics_unnorm = None
 
     if save_predictions_path is not None:
         save_dict_rows_csv(prediction_rows, save_predictions_path)
@@ -568,6 +561,7 @@ def build_model(device):
         ts_feat_dim=len(FEATURE_COLS),
         img_size=IMG_SIZE,
         vision_model_name=VISION_MODEL_NAME,
+        mask_in_chans=MASK_IN_CHANS,
         pretrained=PRETRAINED,
         freeze_vision=FREEZE_VISION,
         d_model=D_MODEL,
@@ -635,19 +629,19 @@ def main():
     print(f"Evaluation output directory: {EVAL_OUTPUT_DIR}")
     print(f"Checkpoint path: {CHECKPOINT_PATH}")
     print(f"Mask mode: {MASK_MODE}")
-    print(f"Use cloud mask: {use_cloud_mask}")
-    print(f"Image sequence length: {IMG_SEQ_LEN}")
+    print(f"Use cloud-mask input: {use_cloud_mask}")
+    print(f"Cloud-mask sequence length: {IMG_SEQ_LEN}")
     print(f"Time-series length: {TS_SEQ_LEN}")
     print(f"Forecast horizon: {HORIZON} minutes")
     print(f"Time-series features: {FEATURE_COLS}")
     print(f"Target columns: {TARGET_COLS}")
-    print("Ignored columns: optical_flow_image_path, temp, pressure, delta_ghi")
-    print("Mask convention: white = cloud = 1, black = sky = 0")
+    print("Ignored columns: raw_image_path, optical_flow_image_path, temp, pressure, delta_ghi")
+    print("Mask convention: R=low cloud, G=mid cloud, B=high cloud, black=sky")
 
     if MASK_MODE == "real":
-        print("Experiment: WITH cloud segmentation mask")
+        print("Experiment: CLOUD-MASK-ONLY vision input")
     elif MASK_MODE == "zero":
-        print("Experiment: WITHOUT cloud segmentation mask")
+        print("Experiment: ZERO-MASK baseline")
     else:
         raise ValueError("MASK_MODE must be either 'real' or 'zero'")
 
@@ -657,8 +651,8 @@ def main():
     norm_stats = load_norm_stats(NORM_STATS_PATH)
 
     if norm_stats is not None:
-        print(f"GHI mean for inverse normalization: {float(norm_stats['mean']['ghi']):.5f}")
-        print(f"GHI std for inverse normalization: {float(norm_stats['std']['ghi']):.5f}")
+        print(f"GHI input mean from training stats: {float(norm_stats['mean']['ghi']):.5f}")
+        print(f"GHI input std from training stats: {float(norm_stats['std']['ghi']):.5f}")
 
     # -------------------------------
     # Build datasets
@@ -667,9 +661,9 @@ def main():
 
     if norm_stats is None:
         norm_stats = datasets["train"].normalization_stats
-        print("Using train dataset normalization stats for inverse normalization.")
-        print(f"GHI mean for inverse normalization: {float(norm_stats['mean']['ghi']):.5f}")
-        print(f"GHI std for inverse normalization: {float(norm_stats['std']['ghi']):.5f}")
+        print("Using train dataset normalization stats for input features.")
+        print(f"GHI input mean from training stats: {float(norm_stats['mean']['ghi']):.5f}")
+        print(f"GHI input std from training stats: {float(norm_stats['std']['ghi']):.5f}")
 
     # -------------------------------
     # DataLoaders
@@ -714,16 +708,16 @@ def main():
     # Evaluate all splits
     # -------------------------------
     summary_rows = []
-    summary_rows_unnorm = []
 
     all_results = {
-        "experiment": "with_cloud_mask" if use_cloud_mask else "without_cloud_mask",
+        "experiment": "cloud_mask_only" if use_cloud_mask else "zero_mask_baseline",
         "mask_mode": MASK_MODE,
         "checkpoint_path": CHECKPOINT_PATH,
         "csv_path": CSV_PATH,
         "feature_cols": FEATURE_COLS,
         "target_cols": TARGET_COLS,
         "ignored_columns": [
+            "raw_image_path",
             "optical_flow_image_path",
             "temp",
             "pressure",
@@ -732,6 +726,7 @@ def main():
         "img_seq_len": IMG_SEQ_LEN,
         "ts_seq_len": TS_SEQ_LEN,
         "horizon": HORIZON,
+        "mask_in_chans": MASK_IN_CHANS,
         "splits": {},
     }
 
@@ -746,7 +741,7 @@ def main():
                 f"predictions_{split_name}.csv",
             )
 
-        metrics, per_horizon_rows, metrics_unnorm = evaluate_split(
+        metrics, per_horizon_rows, _ = evaluate_split(
             model=model,
             loader=loader,
             device=device,
@@ -757,25 +752,14 @@ def main():
         )
 
         print(
-            f"{split_name.upper()} NORMALIZED | "
+            f"{split_name.upper()} | "
             f"Samples: {metrics['num_samples']} | "
             f"Loss: {metrics['loss']:.5f} | "
-            f"RMSE: {metrics['rmse']:.3f} | "
-            f"MAE: {metrics['mae']:.3f} | "
-            f"MBE: {metrics['mbe']:.3f} | "
+            f"RMSE: {metrics['rmse']:.3f} W/m² | "
+            f"MAE: {metrics['mae']:.3f} W/m² | "
+            f"MBE: {metrics['mbe']:.3f} W/m² | "
             f"R2: {metrics['r2']:.4f}"
         )
-
-        if metrics_unnorm is not None:
-            print(
-                f"{split_name.upper()} UNNORMALIZED | "
-                f"Samples: {metrics_unnorm['num_samples']} | "
-                f"MSE: {metrics_unnorm['mse']:.3f} | "
-                f"RMSE: {metrics_unnorm['rmse']:.3f} W/m² | "
-                f"MAE: {metrics_unnorm['mae']:.3f} W/m² | "
-                f"MBE: {metrics_unnorm['mbe']:.3f} W/m² | "
-                f"R2: {metrics_unnorm['r2']:.4f}"
-            )
 
         summary_row = {
             "split": split_name,
@@ -791,20 +775,6 @@ def main():
 
         summary_rows.append(summary_row)
 
-        if metrics_unnorm is not None:
-            summary_row_unnorm = {
-                "split": split_name,
-                "num_samples": metrics_unnorm["num_samples"],
-                "num_forecast_points": metrics_unnorm["num_forecast_points"],
-                "mse": metrics_unnorm["mse"],
-                "rmse": metrics_unnorm["rmse"],
-                "mae": metrics_unnorm["mae"],
-                "mbe": metrics_unnorm["mbe"],
-                "r2": metrics_unnorm["r2"],
-            }
-
-            summary_rows_unnorm.append(summary_row_unnorm)
-
         per_horizon_path = os.path.join(
             EVAL_OUTPUT_DIR,
             f"per_horizon_metrics_{split_name}.csv",
@@ -817,7 +787,6 @@ def main():
 
         all_results["splits"][split_name] = {
             "overall_metrics": metrics,
-            "overall_metrics_unnormalized": metrics_unnorm,
             "per_horizon_metrics": per_horizon_rows,
             "predictions_csv": prediction_path,
         }
@@ -832,9 +801,10 @@ def main():
     save_json(all_results, summary_json_path)
 
     # -------------------------------
-    # Print final normalized table
+    # Print final table
     # -------------------------------
-    print("\n================ NORMALIZED EVALUATION SUMMARY ================")
+    print("\n================ EVALUATION SUMMARY ================")
+    print("Units: RMSE, MAE, and MBE are in W/m². MSE is in (W/m²)².")
     print(
         f"{'split':<10} "
         f"{'samples':>10} "
@@ -850,32 +820,6 @@ def main():
             f"{row['split']:<10} "
             f"{row['num_samples']:>10} "
             f"{row['loss']:>12.5f} "
-            f"{row['rmse']:>12.3f} "
-            f"{row['mae']:>12.3f} "
-            f"{row['mbe']:>12.3f} "
-            f"{row['r2']:>10.4f}"
-        )
-
-    # -------------------------------
-    # Print final unnormalized table
-    # -------------------------------
-    print("\n================ UNNORMALIZED EVALUATION SUMMARY ================")
-    print("Units: RMSE, MAE, and MBE are in W/m². MSE is in (W/m²)².")
-    print(
-        f"{'split':<10} "
-        f"{'samples':>10} "
-        f"{'mse':>12} "
-        f"{'rmse':>12} "
-        f"{'mae':>12} "
-        f"{'mbe':>12} "
-        f"{'r2':>10}"
-    )
-
-    for row in summary_rows_unnorm:
-        print(
-            f"{row['split']:<10} "
-            f"{row['num_samples']:>10} "
-            f"{row['mse']:>12.3f} "
             f"{row['rmse']:>12.3f} "
             f"{row['mae']:>12.3f} "
             f"{row['mbe']:>12.3f} "

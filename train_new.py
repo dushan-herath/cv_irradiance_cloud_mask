@@ -32,14 +32,14 @@ ROOT_DIR = ""
 # -------------------------------
 # Experiment mode
 # -------------------------------
-# "real" -> with cloud segmentation mask
-# "zero" -> without cloud segmentation mask
+# "real" -> cloud-mask-only model
+# "zero" -> same model with zero mask images for an ablation baseline
 MASK_MODE = "real"
 
 # Recommended output directories:
-# With mask    -> "runs/with_cloud_mask"
-# Without mask -> "runs/without_cloud_mask"
-OUTPUT_DIR = "runs/without_cloud_mask"
+# Mask only -> "runs/cloud_mask_only"
+# Zero mask -> "runs/zero_mask_baseline"
+OUTPUT_DIR = "runs/cloud_mask_only"
 
 # -------------------------------
 # Dataset split
@@ -63,18 +63,21 @@ FEATURE_COLS = ["ghi", "dni", "dhi"]
 TARGET_COLS = ["ghi"]
 
 # -------------------------------
-# Image settings
+# Cloud-mask image settings
 # -------------------------------
 IMG_SIZE = 224
 
 # Mask convention:
-# white = cloud = 1
-# black = sky   = 0
+# R = low cloud
+# G = mid cloud
+# B = high cloud
+# black = sky
 
 # -------------------------------
 # Model settings
 # -------------------------------
 VISION_MODEL_NAME = "vit_tiny_patch16_224"
+MASK_IN_CHANS = 3
 PRETRAINED = True
 FREEZE_VISION = False
 
@@ -212,14 +215,13 @@ def train_one_epoch(
     loop = tqdm(loader, total=len(loader), desc="Training", leave=True)
 
     for i, batch in enumerate(loop):
-        rgb_seq, mask_seq, ts_seq, targets, *_ = batch
+        mask_seq, ts_seq, targets, *_ = batch
 
-        rgb_seq = rgb_seq.to(device, non_blocking=True)
         mask_seq = mask_seq.to(device, non_blocking=True)
         ts_seq = ts_seq.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
-        batch_size = rgb_seq.size(0)
+        batch_size = mask_seq.size(0)
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -227,9 +229,8 @@ def train_one_epoch(
 
         with torch.cuda.amp.autocast(enabled=use_amp):
             preds = model(
-                rgb=rgb_seq,
-                ts=ts_seq,
                 cloud_mask=mask_seq,
+                ts=ts_seq,
                 use_cloud_mask=use_cloud_mask,
             )
 
@@ -295,19 +296,17 @@ def evaluate_one_epoch(
 
     with torch.no_grad():
         for i, batch in enumerate(loop):
-            rgb_seq, mask_seq, ts_seq, targets, *_ = batch
+            mask_seq, ts_seq, targets, *_ = batch
 
-            rgb_seq = rgb_seq.to(device, non_blocking=True)
             mask_seq = mask_seq.to(device, non_blocking=True)
             ts_seq = ts_seq.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
-            batch_size = rgb_seq.size(0)
+            batch_size = mask_seq.size(0)
 
             preds = model(
-                rgb=rgb_seq,
-                ts=ts_seq,
                 cloud_mask=mask_seq,
+                ts=ts_seq,
                 use_cloud_mask=use_cloud_mask,
             )
 
@@ -431,6 +430,7 @@ def save_checkpoint(
             "target_cols": TARGET_COLS,
             "img_size": IMG_SIZE,
             "vision_model_name": VISION_MODEL_NAME,
+            "mask_in_chans": MASK_IN_CHANS,
             "pretrained": PRETRAINED,
             "freeze_vision": FREEZE_VISION,
             "d_model": D_MODEL,
@@ -491,19 +491,19 @@ def main():
     print(f"Root directory: {ROOT_DIR}")
     print(f"Output directory: {OUTPUT_DIR}")
     print(f"Mask mode: {MASK_MODE}")
-    print(f"Use cloud mask: {use_cloud_mask}")
-    print(f"Image sequence length: {IMG_SEQ_LEN}")
+    print(f"Use cloud-mask input: {use_cloud_mask}")
+    print(f"Cloud-mask sequence length: {IMG_SEQ_LEN}")
     print(f"Time-series length: {TS_SEQ_LEN}")
     print(f"Forecast horizon: {HORIZON} minutes")
     print(f"Time-series features: {FEATURE_COLS}")
     print(f"Target columns: {TARGET_COLS}")
-    print("Ignored columns: optical_flow_image_path, temp, pressure, delta_ghi")
-    print("Mask convention: white = cloud = 1, black = sky = 0")
+    print("Ignored columns: raw_image_path, optical_flow_image_path, temp, pressure, delta_ghi")
+    print("Mask convention: R=low cloud, G=mid cloud, B=high cloud, black=sky")
 
     if MASK_MODE == "real":
-        print("Experiment: WITH cloud segmentation mask")
+        print("Experiment: CLOUD-MASK-ONLY vision input")
     elif MASK_MODE == "zero":
-        print("Experiment: WITHOUT cloud segmentation mask")
+        print("Experiment: ZERO-MASK baseline")
     else:
         raise ValueError("MASK_MODE must be either 'real' or 'zero'")
 
@@ -610,6 +610,7 @@ def main():
         ts_feat_dim=len(FEATURE_COLS),
         img_size=IMG_SIZE,
         vision_model_name=VISION_MODEL_NAME,
+        mask_in_chans=MASK_IN_CHANS,
         pretrained=PRETRAINED,
         freeze_vision=FREEZE_VISION,
         d_model=D_MODEL,
@@ -792,6 +793,7 @@ def main():
                     "best_val_loss": best_val_loss,
                     "val_metrics": val_metrics,
                     "mask_mode": MASK_MODE,
+                    "mask_in_chans": MASK_IN_CHANS,
                     "feature_cols": FEATURE_COLS,
                     "target_cols": TARGET_COLS,
                     "horizon": HORIZON,
@@ -840,12 +842,13 @@ def main():
     )
 
     final_results = {
-        "experiment": "with_cloud_mask" if use_cloud_mask else "without_cloud_mask",
+        "experiment": "cloud_mask_only" if use_cloud_mask else "zero_mask_baseline",
         "mask_mode": MASK_MODE,
         "csv_path": CSV_PATH,
         "feature_cols": FEATURE_COLS,
         "target_cols": TARGET_COLS,
         "ignored_columns": [
+            "raw_image_path",
             "optical_flow_image_path",
             "temp",
             "pressure",
@@ -854,6 +857,7 @@ def main():
         "img_seq_len": IMG_SEQ_LEN,
         "ts_seq_len": TS_SEQ_LEN,
         "horizon": HORIZON,
+        "mask_in_chans": MASK_IN_CHANS,
         "best_val_rmse": best_val_rmse,
         "best_val_loss": best_val_loss,
         "final_val_metrics": final_val_metrics,

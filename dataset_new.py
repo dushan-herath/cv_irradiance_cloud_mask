@@ -31,13 +31,12 @@ class IrradianceForecastDataset(Dataset):
         Dataset for solar irradiance forecasting.
 
         Inputs:
-            RGB sky image sequence:
+            Cloud-mask image sequence:
                 shape = (T_img, 3, H, W)
-
-            Cloud mask sequence:
-                shape = (T_img, 1, H, W)
-                white = cloud = 1
-                black = sky   = 0
+                R = low cloud
+                G = mid cloud
+                B = high cloud
+                black = clear sky
 
             Time-series sequence:
                 shape = (T_ts, 3)
@@ -48,8 +47,8 @@ class IrradianceForecastDataset(Dataset):
                 shape = (horizon, 1)
 
         mask_mode:
-            "real" -> load real cloud mask
-            "zero" -> return zero mask for without-cloud-mask experiment
+            "real" -> load real cloud-mask image
+            "zero" -> return zero mask image for an ablation baseline
         """
 
         # -------------------------------
@@ -104,8 +103,7 @@ class IrradianceForecastDataset(Dataset):
         self.feature_cols = feature_cols or ["ghi", "dni", "dhi"]
         self.target_cols = target_cols or ["ghi"]
 
-        # Image path columns
-        self.sky_col = "raw_image_path"
+        # Vision input path column. The original sky-image path is not used.
         self.mask_col = "cloud_mask_image_path"
 
         self.max_lookback = max(img_seq_len, ts_seq_len)
@@ -116,7 +114,7 @@ class IrradianceForecastDataset(Dataset):
         # -------------------------------
         # Check required columns
         # -------------------------------
-        required_cols = [self.sky_col, self.mask_col, self.time_col] + self.feature_cols + self.target_cols
+        required_cols = [self.mask_col, self.time_col] + self.feature_cols + self.target_cols
 
         missing_cols = [c for c in required_cols if c not in self.df.columns]
         if missing_cols:
@@ -151,17 +149,11 @@ class IrradianceForecastDataset(Dataset):
         self.df[self.feature_cols] = (self.df[self.feature_cols] - mean) / std
 
         # -------------------------------
-        # Image preprocessing
+        # Cloud-mask image preprocessing
         # -------------------------------
-        self.img_resize = transforms.Resize((img_size, img_size))
         self.mask_resize = transforms.Resize(
             (img_size, img_size),
             interpolation=TF.InterpolationMode.NEAREST,
-        )
-
-        self.img_normalize = transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225],
         )
 
         # -------------------------------
@@ -169,13 +161,15 @@ class IrradianceForecastDataset(Dataset):
         # -------------------------------
         print(f"\nDataset initialized ({split.upper()}): {len(self)} samples")
         print(f"CSV path: {csv_path}")
-        print(f"Image sequence length: {img_seq_len}")
+        print(f"Cloud-mask sequence length: {img_seq_len}")
         print(f"Time-series length: {ts_seq_len}")
         print(f"Forecast horizon: {horizon}")
         print(f"Time-series features: {self.feature_cols}")
         print(f"Target columns: {self.target_cols}")
         print(f"Mask mode: {self.mask_mode}")
-        print("Mask convention: white = cloud = 1, black = sky = 0")
+        print(f"Mask column: {self.mask_col}")
+        print("Vision input: cloud masks only; raw sky images are not loaded")
+        print("Mask convention: R=low cloud, G=mid cloud, B=high cloud, black=sky")
 
     def __len__(self):
         return len(self.df) - self.max_lookback - self.horizon
@@ -191,26 +185,20 @@ class IrradianceForecastDataset(Dataset):
 
         return os.path.join(self.root_dir, path_value)
 
-    def _load_rgb_image(self, path):
-        """
-        Loads and preprocesses an RGB sky image.
-        """
-        img = Image.open(path).convert("RGB")
-        img = self.img_resize(img)
-        return img
-
     def _load_cloud_mask(self, path):
         """
-        Loads cloud mask.
+        Loads a cloud-mask image.
 
         Important:
-            white = cloud = 1
-            black = sky   = 0
+            R = low cloud
+            G = mid cloud
+            B = high cloud
+            black = clear sky
 
-        The mask is loaded as grayscale, resized using nearest-neighbor,
-        and converted into a binary tensor.
+        The mask is loaded as RGB, resized using nearest-neighbor, and
+        converted into a binary 3-channel tensor.
         """
-        mask = Image.open(path).convert("L")
+        mask = Image.open(path).convert("RGB")
         mask = self.mask_resize(mask)
         return mask
 
@@ -218,7 +206,7 @@ class IrradianceForecastDataset(Dataset):
         # -------------------------------
         # Select windows
         # -------------------------------
-        img_window = self.df.iloc[
+        mask_window = self.df.iloc[
             idx + self.ts_seq_len - self.img_seq_len : idx + self.ts_seq_len
         ]
 
@@ -232,39 +220,24 @@ class IrradianceForecastDataset(Dataset):
 
         # -------------------------------
         # One random rotation per sequence
-        # Same rotation is applied to RGB and mask.
-        # Mask uses nearest-neighbor interpolation.
+        # Rotation is applied to the mask sequence using nearest-neighbor
+        # interpolation to preserve discrete cloud-type colors.
         # -------------------------------
         if self.split == "train" and self.apply_rotation:
             angle = random.uniform(-180, 180)
         else:
             angle = 0.0
 
-        rgb_seq = []
         mask_seq = []
 
-        for sky_p, mask_p in zip(
-            img_window[self.sky_col].values,
-            img_window[self.mask_col].values,
-        ):
-            sky_path = self._resolve_path(sky_p)
+        for mask_p in mask_window[self.mask_col].values:
             mask_path = self._resolve_path(mask_p)
 
-            # ---- Load RGB sky image ----
-            sky_img = self._load_rgb_image(sky_path)
-
-            # ---- Load cloud mask ----
+            # ---- Load cloud-mask image ----
             cloud_mask = self._load_cloud_mask(mask_path)
 
-            # ---- Shared augmentation ----
+            # ---- Augmentation ----
             if angle != 0.0:
-                sky_img = TF.rotate(
-                    sky_img,
-                    angle=angle,
-                    interpolation=TF.InterpolationMode.BILINEAR,
-                    fill=0,
-                )
-
                 cloud_mask = TF.rotate(
                     cloud_mask,
                     angle=angle,
@@ -272,32 +245,24 @@ class IrradianceForecastDataset(Dataset):
                     fill=0,
                 )
 
-            # ---- RGB to tensor and normalize ----
-            sky_tensor = TF.to_tensor(sky_img)
-            sky_tensor = self.img_normalize(sky_tensor)
-
             # ---- Mask to tensor ----
             if self.mask_mode == "real":
                 mask_tensor = TF.to_tensor(cloud_mask)
 
-                # Convert possible 0-255 mask into binary 0/1.
-                # Since white = cloud, no inversion is applied.
+                # Convert possible antialiasing/compression values into
+                # binary RGB cloud-type channels.
                 mask_tensor = (mask_tensor > 0.5).float()
             else:
-                # Without-cloud-mask experiment.
-                # Same tensor shape, but contains no cloud information.
                 mask_tensor = torch.zeros(
-                    1,
+                    3,
                     self.img_size,
                     self.img_size,
                     dtype=torch.float32,
                 )
 
-            rgb_seq.append(sky_tensor)
             mask_seq.append(mask_tensor)
 
-        rgb_seq = torch.stack(rgb_seq)      # (T_img, 3, H, W)
-        mask_seq = torch.stack(mask_seq)    # (T_img, 1, H, W)
+        mask_seq = torch.stack(mask_seq)    # (T_img, 3, H, W)
 
         # -------------------------------
         # Time-series inputs
@@ -338,7 +303,7 @@ class IrradianceForecastDataset(Dataset):
             ts_time = []
             tgt_time = []
 
-        return rgb_seq, mask_seq, ts_seq, target_seq, ts_time, tgt_time
+        return mask_seq, ts_seq, target_seq, ts_time, tgt_time
 
 
 # ======================================================================
@@ -380,10 +345,9 @@ if __name__ == "__main__":
         normalization_stats=train_dataset.normalization_stats,
     )
 
-    rgb_seq, mask_seq, ts_seq, target_seq, ts_time, tgt_time = train_dataset[2800]
+    mask_seq, ts_seq, target_seq, ts_time, tgt_time = train_dataset[2800]
 
-    print("RGB sequence shape:", rgb_seq.shape)          # (T_img, 3, H, W)
-    print("Mask sequence shape:", mask_seq.shape)        # (T_img, 1, H, W)
+    print("Mask sequence shape:", mask_seq.shape)        # (T_img, 3, H, W)
     print("TS sequence shape:", ts_seq.shape)            # (T_ts, 3)
     print("Target sequence shape:", target_seq.shape)    # (20, 1)
 
@@ -393,26 +357,18 @@ if __name__ == "__main__":
     print("Last target timestamp:", tgt_time[-1])
 
     # -------------------------------
-    # Visualize RGB and cloud mask
+    # Visualize cloud masks
     # -------------------------------
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    T = mask_seq.shape[0]
+    fig, axes = plt.subplots(1, T, figsize=(3 * T, 3))
 
-    T = rgb_seq.shape[0]
-    fig, axes = plt.subplots(2, T, figsize=(3 * T, 6))
+    if T == 1:
+        axes = [axes]
 
     for i in range(T):
-        rgb = rgb_seq[i]
-        rgb_denorm = (rgb * std + mean).clamp(0, 1)
-
-        axes[0, i].imshow(rgb_denorm.permute(1, 2, 0))
-        axes[0, i].set_title("RGB")
-        axes[0, i].axis("off")
-
-        mask = mask_seq[i, 0]
-        axes[1, i].imshow(mask, cmap="gray", vmin=0, vmax=1)
-        axes[1, i].set_title("Cloud Mask")
-        axes[1, i].axis("off")
+        axes[i].imshow(mask_seq[i].permute(1, 2, 0))
+        axes[i].set_title("Cloud Mask")
+        axes[i].axis("off")
 
     plt.tight_layout()
     plt.show()

@@ -34,37 +34,39 @@ class PositionalEncoding(nn.Module):
 
 
 # -------------------------------------------------------
-# Mask-aware vision encoder
+# Cloud-mask-only vision encoder
 # -------------------------------------------------------
-class MaskAwareVisionEncoder(nn.Module):
+class CloudMaskOnlyVisionEncoder(nn.Module):
     """
     Input:
-        RGB image       : 3 channels
-        Cloud mask      : 1 channel
+        Cloud mask image: 3 channels
 
-    Final input:
-        RGB + mask      : 4 channels
-
-    Mask convention:
-        white = cloud = 1
-        black = sky   = 0
+    Channel convention for the generated RGB masks:
+        R = low cloud
+        G = mid cloud
+        B = high cloud
+        black = clear sky
     """
 
     def __init__(
         self,
         model_name="vit_base_patch16_224",
         img_size=224,
+        mask_in_chans=3,
         pretrained=True,
         freeze_backbone=False,
     ):
         super().__init__()
+
+        self.mask_in_chans = mask_in_chans
+        self.cloud_stat_dim = mask_in_chans * 2
 
         self.backbone = timm.create_model(
             model_name,
             pretrained=pretrained,
             num_classes=0,
             img_size=img_size,
-            in_chans=4,
+            in_chans=mask_in_chans,
             global_pool="avg",
         )
 
@@ -74,48 +76,48 @@ class MaskAwareVisionEncoder(nn.Module):
             for p in self.backbone.parameters():
                 p.requires_grad = False
 
-    def forward(self, rgb, cloud_mask=None, use_cloud_mask=True):
+    def forward(self, cloud_mask, use_cloud_mask=True):
         """
-        rgb:
+        cloud_mask:
             (B, T_img, 3, H, W)
 
-        cloud_mask:
-            (B, T_img, 1, H, W)
-
         use_cloud_mask:
-            True  -> use real cloud mask
-            False -> replace cloud mask with zeros
+            True  -> use real cloud mask image
+            False -> replace cloud mask image with zeros
         """
 
-        B, T, C, H, W = rgb.shape
+        if cloud_mask is None:
+            raise ValueError("cloud_mask must be provided for the mask-only model")
 
-        if use_cloud_mask and cloud_mask is not None:
-            mask = cloud_mask.float()
+        B, T, C, H, W = cloud_mask.shape
 
-            # Convert 0-255 mask into 0-1 mask if needed.
-            if mask.max() > 1.0:
-                mask = mask / 255.0
+        mask = cloud_mask.float()
 
-            # White = cloud, black = sky.
-            # So we do NOT invert the mask.
-            mask = (mask > 0.5).float()
+        if C != self.mask_in_chans:
+            if C == 1 and self.mask_in_chans == 3:
+                mask = mask.repeat(1, 1, 3, 1, 1)
+            else:
+                raise ValueError(
+                    f"Expected {self.mask_in_chans} mask channel(s), got {C}"
+                )
 
-        else:
-            # Without-cloud-mask experiment.
-            # Same architecture, but the mask channel contains no information.
-            mask = torch.zeros(B, T, 1, H, W, device=rgb.device, dtype=rgb.dtype)
+        # Convert possible 0-255 masks into 0-1 masks if needed.
+        if mask.max() > 1.0:
+            mask = mask / 255.0
 
-        # RGB + cloud mask = 4-channel image.
-        x = torch.cat([rgb, mask], dim=2)  # (B, T, 4, H, W)
+        mask = (mask > 0.5).float()
 
-        x = x.view(B * T, 4, H, W)
+        if not use_cloud_mask:
+            mask = torch.zeros_like(mask)
+
+        x = mask.reshape(B * T, self.mask_in_chans, H, W)
         feat = self.backbone(x)
         feat = feat.view(B, T, -1)
 
         # Mask-derived cloud statistics.
         # This is not from the CSV time-series columns.
         # It is computed only from the segmentation mask.
-        cloud_coverage = mask.mean(dim=[2, 3, 4]).unsqueeze(-1)  # (B, T, 1)
+        cloud_coverage = mask.mean(dim=[3, 4])  # (B, T, C)
 
         delta_cloud_coverage = torch.zeros_like(cloud_coverage)
         delta_cloud_coverage[:, 1:] = cloud_coverage[:, 1:] - cloud_coverage[:, :-1]
@@ -123,7 +125,7 @@ class MaskAwareVisionEncoder(nn.Module):
         cloud_stats = torch.cat(
             [cloud_coverage, delta_cloud_coverage],
             dim=-1
-        )  # (B, T, 2)
+        )  # (B, T, 2 * C)
 
         return feat, cloud_stats
 
@@ -243,7 +245,7 @@ class VisionTemporalEncoder(nn.Module):
 # Gated fusion
 # -------------------------------------------------------
 class MaskAwareGatedFusion(nn.Module):
-    def __init__(self, vision_dim, ts_dim, cloud_stat_dim=2, fused_dim=128):
+    def __init__(self, vision_dim, ts_dim, cloud_stat_dim=6, fused_dim=128):
         super().__init__()
 
         self.vision_proj = nn.Sequential(
@@ -297,19 +299,19 @@ class MaskAwareGatedFusion(nn.Module):
 # -------------------------------------------------------
 class CloudMaskAblationForecaster(nn.Module):
     """
-    Same model for both studies:
+    Mask-only forecasting model.
 
-    1. Without cloud segmentation mask:
-        use_cloud_mask=False
-
-    2. With cloud segmentation mask:
-        use_cloud_mask=True
+    Vision input:
+        RGB cloud-type mask sequence only. The original sky image is not used.
 
     Time-series input:
         ghi, dni, dhi only
 
     Forecast horizon:
         20 minutes
+
+    use_cloud_mask=False keeps the same architecture but replaces the mask
+    image with zeros for a time-series-plus-zero-vision baseline.
     """
 
     def __init__(
@@ -317,6 +319,7 @@ class CloudMaskAblationForecaster(nn.Module):
         ts_feat_dim=3,
         img_size=224,
         vision_model_name="vit_base_patch16_224",
+        mask_in_chans=3,
         pretrained=True,
         freeze_vision=False,
         d_model=128,
@@ -326,9 +329,10 @@ class CloudMaskAblationForecaster(nn.Module):
     ):
         super().__init__()
 
-        self.vision_encoder = MaskAwareVisionEncoder(
+        self.vision_encoder = CloudMaskOnlyVisionEncoder(
             model_name=vision_model_name,
             img_size=img_size,
+            mask_in_chans=mask_in_chans,
             pretrained=pretrained,
             freeze_backbone=freeze_vision,
         )
@@ -354,7 +358,7 @@ class CloudMaskAblationForecaster(nn.Module):
         self.fusion = MaskAwareGatedFusion(
             vision_dim=d_model,
             ts_dim=d_model,
-            cloud_stat_dim=2,
+            cloud_stat_dim=self.vision_encoder.cloud_stat_dim,
             fused_dim=fused_dim,
         )
 
@@ -383,34 +387,29 @@ class CloudMaskAblationForecaster(nn.Module):
         self.horizon = horizon
         self.target_dim = target_dim
 
-    def forward(self, rgb, ts, cloud_mask=None, use_cloud_mask=True):
+    def forward(self, cloud_mask, ts, use_cloud_mask=True):
         """
-        rgb:
+        cloud_mask:
             (B, T_img, 3, H, W)
 
         ts:
             (B, T_ts, 3)
             feature order: ghi, dni, dhi
 
-        cloud_mask:
-            (B, T_img, 1, H, W)
-            white = cloud, black = sky
-
         output:
             (B, 20, 1)
             next 20 minutes of GHI
         """
 
-        B, T_img = rgb.shape[:2]
+        B, T_img = cloud_mask.shape[:2]
 
-        # Image + optional cloud mask encoding.
+        # Cloud-mask image encoding. Original RGB sky images are not used.
         vision_feat, cloud_stats = self.vision_encoder(
-            rgb=rgb,
             cloud_mask=cloud_mask,
             use_cloud_mask=use_cloud_mask,
         )
 
-        # Temporal modeling of image sequence.
+        # Temporal modeling of cloud-mask sequence.
         vision_feat = self.vision_temporal(vision_feat)
 
         # Time-series modeling using only GHI, DNI, DHI.
@@ -449,6 +448,7 @@ if __name__ == "__main__":
         ts_feat_dim=3,          # ghi, dni, dhi only
         img_size=224,
         vision_model_name="vit_base_patch16_224",
+        mask_in_chans=3,
         pretrained=True,
         freeze_vision=False,
         d_model=128,
@@ -463,28 +463,23 @@ if __name__ == "__main__":
     H = 224
     W = 224
 
-    rgb = torch.randn(B, T_img, 3, H, W).to(device)
-
-    # White = cloud, black = sky.
-    # Example mask should be in shape (B, T_img, 1, H, W).
-    cloud_mask = torch.randint(0, 2, (B, T_img, 1, H, W)).float().to(device)
+    # RGB cloud-type masks: R=low cloud, G=mid cloud, B=high cloud.
+    cloud_mask = torch.randint(0, 2, (B, T_img, 3, H, W)).float().to(device)
 
     # Only GHI, DNI, DHI.
     ts = torch.randn(B, T_ts, 3).to(device)
 
-    # Experiment 1: without cloud segmentation mask
+    # Optional baseline: mask image replaced with zeros.
     y_without_mask = model(
-        rgb=rgb,
-        ts=ts,
         cloud_mask=cloud_mask,
+        ts=ts,
         use_cloud_mask=False,
     )
 
-    # Experiment 2: with cloud segmentation mask
+    # Main mask-only model.
     y_with_mask = model(
-        rgb=rgb,
-        ts=ts,
         cloud_mask=cloud_mask,
+        ts=ts,
         use_cloud_mask=True,
     )
 
