@@ -26,6 +26,7 @@ class IrradianceForecastDataset(Dataset):
         root_dir: str = "",
         mask_mode: str = "real",
         apply_rotation: bool = True,
+        normalize_targets: bool = True,
     ):
         """
         Dataset for solar irradiance forecasting.
@@ -49,6 +50,10 @@ class IrradianceForecastDataset(Dataset):
         mask_mode:
             "real" -> load real cloud-mask image
             "zero" -> return zero mask image for an ablation baseline
+
+        normalize_targets:
+            True -> train on normalized target GHI and invert back to W/m^2
+                    during evaluation.
         """
 
         # -------------------------------
@@ -99,6 +104,7 @@ class IrradianceForecastDataset(Dataset):
         self.root_dir = root_dir
         self.mask_mode = mask_mode
         self.apply_rotation = apply_rotation
+        self.normalize_targets = normalize_targets
 
         self.feature_cols = feature_cols or ["ghi", "dni", "dhi"]
         self.target_cols = target_cols or ["ghi"]
@@ -121,20 +127,31 @@ class IrradianceForecastDataset(Dataset):
             raise ValueError(f"Missing columns in CSV: {missing_cols}")
 
         # -------------------------------
-        # Feature normalization
-        # Only normalize input features: ghi, dni, dhi
-        # Target GHI remains in original W/m² scale.
+        # Feature and target normalization
+        #
+        # Keep the raw DataFrame unchanged. GHI is both an input feature and
+        # the forecast target in the default config, so input and target values
+        # must be normalized into separate tables instead of mutating self.df.
         # -------------------------------
         if split == "train":
-            mean = self.df[self.feature_cols].mean()
-            std = self.df[self.feature_cols].std()
+            feature_mean = self.df[self.feature_cols].mean()
+            feature_std = self.df[self.feature_cols].std()
+            target_mean = self.df[self.target_cols].mean()
+            target_std = self.df[self.target_cols].std()
 
             # Avoid division by zero if any column is constant.
-            std = std.replace(0, 1.0)
+            feature_std = feature_std.replace(0, 1.0)
+            target_std = target_std.replace(0, 1.0)
 
             self.normalization_stats = {
-                "mean": mean,
-                "std": std,
+                "feature_mean": feature_mean,
+                "feature_std": feature_std,
+                "target_mean": target_mean,
+                "target_std": target_std,
+                "normalize_targets": self.normalize_targets,
+                # Legacy aliases for older helper code.
+                "mean": feature_mean,
+                "std": feature_std,
             }
         else:
             if normalization_stats is None:
@@ -143,10 +160,50 @@ class IrradianceForecastDataset(Dataset):
                 )
 
             self.normalization_stats = normalization_stats
-            mean = normalization_stats["mean"]
-            std = normalization_stats["std"]
+            self.normalize_targets = bool(
+                normalization_stats.get("normalize_targets", self.normalize_targets)
+            )
+            feature_mean = normalization_stats.get(
+                "feature_mean",
+                normalization_stats.get("mean"),
+            )
+            feature_std = normalization_stats.get(
+                "feature_std",
+                normalization_stats.get("std"),
+            )
+            target_mean = normalization_stats.get("target_mean")
+            target_std = normalization_stats.get("target_std")
 
-        self.df[self.feature_cols] = (self.df[self.feature_cols] - mean) / std
+            if self.normalize_targets and (target_mean is None or target_std is None):
+                target_mean = normalization_stats.get("mean")
+                target_std = normalization_stats.get("std")
+
+        if feature_mean is None or feature_std is None:
+            raise ValueError("normalization_stats must include feature mean/std values")
+
+        if self.normalize_targets and (target_mean is None or target_std is None):
+            raise ValueError("normalize_targets=True requires target mean/std values")
+
+        feature_mean = pd.Series(feature_mean, dtype="float32").reindex(self.feature_cols)
+        feature_std = pd.Series(feature_std, dtype="float32").reindex(self.feature_cols)
+
+        if feature_mean.isna().any() or feature_std.isna().any():
+            raise ValueError("Feature normalization stats do not match feature_cols")
+
+        if target_mean is not None and target_std is not None:
+            target_mean = pd.Series(target_mean, dtype="float32").reindex(self.target_cols)
+            target_std = pd.Series(target_std, dtype="float32").reindex(self.target_cols)
+
+            if target_mean.isna().any() or target_std.isna().any():
+                raise ValueError("Target normalization stats do not match target_cols")
+
+        self.feature_df = self.df[self.feature_cols].astype("float32").copy()
+        self.feature_df = (self.feature_df - feature_mean) / feature_std
+
+        self.target_df = self.df[self.target_cols].astype("float32").copy()
+
+        if self.normalize_targets:
+            self.target_df = (self.target_df - target_mean) / target_std
 
         # -------------------------------
         # Cloud-mask image preprocessing
@@ -166,6 +223,7 @@ class IrradianceForecastDataset(Dataset):
         print(f"Forecast horizon: {horizon}")
         print(f"Time-series features: {self.feature_cols}")
         print(f"Target columns: {self.target_cols}")
+        print(f"Normalize targets: {self.normalize_targets}")
         print(f"Mask mode: {self.mask_mode}")
         print(f"Mask column: {self.mask_col}")
         print("Vision input: cloud masks only; raw sky images are not loaded")
@@ -269,7 +327,7 @@ class IrradianceForecastDataset(Dataset):
         # Only GHI, DNI, DHI are used.
         # -------------------------------
         ts_seq = torch.tensor(
-            ts_window[self.feature_cols].values,
+            self.feature_df.iloc[idx : idx + self.ts_seq_len].values,
             dtype=torch.float32,
         )  # (T_ts, 3)
 
@@ -278,7 +336,9 @@ class IrradianceForecastDataset(Dataset):
         # Future GHI values for 20 minutes.
         # -------------------------------
         target_seq = torch.tensor(
-            target_window[self.target_cols].values,
+            self.target_df.iloc[
+                idx + self.ts_seq_len : idx + self.ts_seq_len + self.horizon
+            ].values,
             dtype=torch.float32,
         )  # (horizon, 1)
 

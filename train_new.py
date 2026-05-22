@@ -37,9 +37,9 @@ ROOT_DIR = ""
 MASK_MODE = "real"
 
 # Recommended output directories:
-# Mask only -> "runs/cloud_mask_only"
-# Zero mask -> "runs/zero_mask_baseline"
-OUTPUT_DIR = "runs/cloud_mask_only"
+# Mask only -> "runs/cloud_mask_only_target_norm"
+# Zero mask -> "runs/zero_mask_baseline_target_norm"
+OUTPUT_DIR = "runs/cloud_mask_only_target_norm"
 
 # -------------------------------
 # Dataset split
@@ -61,6 +61,7 @@ HORIZON = 20
 # -------------------------------
 FEATURE_COLS = ["ghi", "dni", "dhi"]
 TARGET_COLS = ["ghi"]
+NORMALIZE_TARGETS = True
 
 # -------------------------------
 # Cloud-mask image settings
@@ -161,8 +162,9 @@ def compute_forecasting_metrics(preds, targets):
     targets:
         numpy array with shape (N, horizon, 1)
 
-    Since target GHI is not normalized in the dataset,
-    RMSE and MAE are reported in W/m².
+    Metrics are computed in whatever scale preds/targets use. During training
+    this is usually normalized target scale; helper code below also reports
+    W/m^2 when target normalization stats are available.
     """
     preds = preds.reshape(-1)
     targets = targets.reshape(-1)
@@ -191,6 +193,60 @@ def compute_forecasting_metrics(preds, targets):
     }
 
 
+def can_inverse_normalize_targets(norm_stats):
+    return (
+        norm_stats is not None
+        and bool(norm_stats.get("normalize_targets", False))
+        and "target_mean" in norm_stats
+        and "target_std" in norm_stats
+    )
+
+
+def inverse_normalize_targets(values, norm_stats):
+    mean = np.array(
+        [float(norm_stats["target_mean"][col]) for col in TARGET_COLS],
+        dtype=np.float32,
+    ).reshape(1, 1, -1)
+    std = np.array(
+        [float(norm_stats["target_std"][col]) for col in TARGET_COLS],
+        dtype=np.float32,
+    ).reshape(1, 1, -1)
+    return values * std + mean
+
+
+def attach_physical_metrics(metrics, preds, targets, norm_stats):
+    if not can_inverse_normalize_targets(norm_stats):
+        return metrics
+
+    preds_wm2 = inverse_normalize_targets(preds, norm_stats)
+    targets_wm2 = inverse_normalize_targets(targets, norm_stats)
+    metrics_wm2 = compute_forecasting_metrics(preds_wm2, targets_wm2)
+
+    for key, value in metrics_wm2.items():
+        metrics[f"{key}_wm2"] = value
+
+    return metrics
+
+
+def format_metrics_line(label, metrics):
+    line = (
+        f"{label} | "
+        f"Loss: {metrics['loss']:.5f} | "
+        f"RMSE(norm): {metrics['rmse']:.3f} | "
+        f"MAE(norm): {metrics['mae']:.3f} | "
+        f"MBE(norm): {metrics['mbe']:.3f}"
+    )
+
+    if "rmse_wm2" in metrics:
+        line += (
+            f" | RMSE: {metrics['rmse_wm2']:.2f} W/m^2 | "
+            f"MAE: {metrics['mae_wm2']:.2f} W/m^2 | "
+            f"MBE: {metrics['mbe_wm2']:.2f} W/m^2"
+        )
+
+    return line + f" | R2: {metrics['r2']:.4f}"
+
+
 # ============================================================
 # Train one epoch
 # ============================================================
@@ -202,6 +258,7 @@ def train_one_epoch(
     device,
     scaler,
     use_cloud_mask,
+    norm_stats=None,
     max_grad_norm=None,
 ):
     model.train()
@@ -269,6 +326,7 @@ def train_one_epoch(
 
     metrics = compute_forecasting_metrics(all_preds, all_targets)
     metrics["loss"] = float(total_loss / total_samples)
+    metrics = attach_physical_metrics(metrics, all_preds, all_targets, norm_stats)
 
     return metrics
 
@@ -282,6 +340,7 @@ def evaluate_one_epoch(
     criterion,
     device,
     use_cloud_mask,
+    norm_stats=None,
     desc="Validation",
 ):
     model.eval()
@@ -333,6 +392,7 @@ def evaluate_one_epoch(
 
     metrics = compute_forecasting_metrics(all_preds, all_targets)
     metrics["loss"] = float(total_loss / total_samples)
+    metrics = attach_physical_metrics(metrics, all_preds, all_targets, norm_stats)
 
     return metrics
 
@@ -384,10 +444,13 @@ def save_history_csv(history, save_path):
 # Save normalization statistics
 # ============================================================
 def save_norm_stats(norm_stats, save_path):
-    serializable = {
-        "mean": norm_stats["mean"].to_dict(),
-        "std": norm_stats["std"].to_dict(),
-    }
+    serializable = {}
+
+    for key, value in norm_stats.items():
+        if hasattr(value, "to_dict"):
+            serializable[key] = value.to_dict()
+        else:
+            serializable[key] = value
 
     with open(save_path, "w") as f:
         json.dump(serializable, f, indent=4)
@@ -428,6 +491,7 @@ def save_checkpoint(
             "horizon": HORIZON,
             "feature_cols": FEATURE_COLS,
             "target_cols": TARGET_COLS,
+            "normalize_targets": NORMALIZE_TARGETS,
             "img_size": IMG_SIZE,
             "vision_model_name": VISION_MODEL_NAME,
             "mask_in_chans": MASK_IN_CHANS,
@@ -465,7 +529,7 @@ def load_checkpoint(filename, model, optimizer, scheduler, device):
 
     print(
         f"Resumed from checkpoint: epoch {start_epoch} | "
-        f"best val RMSE = {best_val_rmse:.5f}"
+        f"best val RMSE (normalized) = {best_val_rmse:.5f}"
     )
 
     return start_epoch, best_val_rmse, best_val_loss, history
@@ -497,6 +561,7 @@ def main():
     print(f"Forecast horizon: {HORIZON} minutes")
     print(f"Time-series features: {FEATURE_COLS}")
     print(f"Target columns: {TARGET_COLS}")
+    print(f"Normalize targets: {NORMALIZE_TARGETS}")
     print("Ignored columns: raw_image_path, optical_flow_image_path, temp, pressure, delta_ghi")
     print("Mask convention: R=low cloud, G=mid cloud, B=high cloud, black=sky")
 
@@ -524,6 +589,7 @@ def main():
         root_dir=ROOT_DIR,
         mask_mode=MASK_MODE,
         apply_rotation=APPLY_ROTATION,
+        normalize_targets=NORMALIZE_TARGETS,
     )
 
     val_ds = IrradianceForecastDataset(
@@ -541,6 +607,7 @@ def main():
         mask_mode=MASK_MODE,
         apply_rotation=False,
         normalization_stats=train_ds.normalization_stats,
+        normalize_targets=NORMALIZE_TARGETS,
     )
 
     test_ds = None
@@ -561,6 +628,7 @@ def main():
             mask_mode=MASK_MODE,
             apply_rotation=False,
             normalization_stats=train_ds.normalization_stats,
+            normalize_targets=NORMALIZE_TARGETS,
         )
 
     save_norm_stats(
@@ -719,6 +787,7 @@ def main():
             device=device,
             scaler=scaler,
             use_cloud_mask=use_cloud_mask,
+            norm_stats=train_ds.normalization_stats,
             max_grad_norm=MAX_GRAD_NORM,
         )
 
@@ -728,6 +797,7 @@ def main():
             criterion=criterion,
             device=device,
             use_cloud_mask=use_cloud_mask,
+            norm_stats=train_ds.normalization_stats,
             desc="Validation",
         )
 
@@ -742,6 +812,10 @@ def main():
             "train_mae": train_metrics["mae"],
             "train_mbe": train_metrics["mbe"],
             "train_r2": train_metrics["r2"],
+            "train_rmse_wm2": train_metrics.get("rmse_wm2"),
+            "train_mae_wm2": train_metrics.get("mae_wm2"),
+            "train_mbe_wm2": train_metrics.get("mbe_wm2"),
+            "train_r2_wm2": train_metrics.get("r2_wm2"),
 
             "val_loss": val_metrics["loss"],
             "val_mse": val_metrics["mse"],
@@ -749,6 +823,10 @@ def main():
             "val_mae": val_metrics["mae"],
             "val_mbe": val_metrics["mbe"],
             "val_r2": val_metrics["r2"],
+            "val_rmse_wm2": val_metrics.get("rmse_wm2"),
+            "val_mae_wm2": val_metrics.get("mae_wm2"),
+            "val_mbe_wm2": val_metrics.get("mbe_wm2"),
+            "val_r2_wm2": val_metrics.get("r2_wm2"),
 
             "lr_vision": optimizer.param_groups[0]["lr"],
             "lr_other": optimizer.param_groups[1]["lr"],
@@ -756,29 +834,14 @@ def main():
 
         history.append(row)
 
-        print(
-            f"Train | "
-            f"Loss: {train_metrics['loss']:.5f} | "
-            f"RMSE: {train_metrics['rmse']:.3f} | "
-            f"MAE: {train_metrics['mae']:.3f} | "
-            f"MBE: {train_metrics['mbe']:.3f} | "
-            f"R2: {train_metrics['r2']:.4f}"
-        )
-
-        print(
-            f"Val   | "
-            f"Loss: {val_metrics['loss']:.5f} | "
-            f"RMSE: {val_metrics['rmse']:.3f} | "
-            f"MAE: {val_metrics['mae']:.3f} | "
-            f"MBE: {val_metrics['mbe']:.3f} | "
-            f"R2: {val_metrics['r2']:.4f}"
-        )
+        print(format_metrics_line("Train", train_metrics))
+        print(format_metrics_line("Val  ", val_metrics))
 
         save_history_csv(history, history_path)
         plot_losses(history, loss_curve_path)
 
         # -------------------------------
-        # Save best model by validation RMSE
+        # Save best model by normalized validation RMSE
         # -------------------------------
         if val_metrics["rmse"] < best_val_rmse:
             best_val_rmse = val_metrics["rmse"]
@@ -796,6 +859,7 @@ def main():
                     "mask_in_chans": MASK_IN_CHANS,
                     "feature_cols": FEATURE_COLS,
                     "target_cols": TARGET_COLS,
+                    "normalize_targets": NORMALIZE_TARGETS,
                     "horizon": HORIZON,
                 },
                 best_model_path,
@@ -838,6 +902,7 @@ def main():
         criterion=criterion,
         device=device,
         use_cloud_mask=use_cloud_mask,
+        norm_stats=train_ds.normalization_stats,
         desc="Final Validation",
     )
 
@@ -847,6 +912,7 @@ def main():
         "csv_path": CSV_PATH,
         "feature_cols": FEATURE_COLS,
         "target_cols": TARGET_COLS,
+        "normalize_targets": NORMALIZE_TARGETS,
         "ignored_columns": [
             "raw_image_path",
             "optical_flow_image_path",
@@ -859,6 +925,11 @@ def main():
         "horizon": HORIZON,
         "mask_in_chans": MASK_IN_CHANS,
         "best_val_rmse": best_val_rmse,
+        "best_val_rmse_wm2": (
+            final_val_metrics.get("rmse_wm2")
+            if final_val_metrics is not None
+            else None
+        ),
         "best_val_loss": best_val_loss,
         "final_val_metrics": final_val_metrics,
     }
@@ -870,6 +941,7 @@ def main():
             criterion=criterion,
             device=device,
             use_cloud_mask=use_cloud_mask,
+            norm_stats=train_ds.normalization_stats,
             desc="Final Test",
         )
 
@@ -881,7 +953,7 @@ def main():
     print(f"\nSaved final results to: {final_results_path}")
 
     print("\nTraining complete")
-    print(f"Best validation RMSE: {best_val_rmse:.3f}")
+    print(f"Best validation RMSE (normalized): {best_val_rmse:.3f}")
     print(f"Best validation loss: {best_val_loss:.5f}")
 
     print("\nFinal validation metrics:")

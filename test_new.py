@@ -36,9 +36,9 @@ ROOT_DIR = ""
 MASK_MODE = "real"
 
 # Must match the folder used during training.
-# Mask only -> "runs/cloud_mask_only"
-# Zero mask -> "runs/zero_mask_baseline"
-OUTPUT_DIR = "runs/cloud_mask_only"
+# Mask only -> "runs/cloud_mask_only_target_norm"
+# Zero mask -> "runs/zero_mask_baseline_target_norm"
+OUTPUT_DIR = "runs/cloud_mask_only_target_norm"
 
 # -------------------------------
 # Checkpoint to evaluate
@@ -74,6 +74,7 @@ HORIZON = 20
 # -------------------------------
 FEATURE_COLS = ["ghi", "dni", "dhi"]
 TARGET_COLS = ["ghi"]
+NORMALIZE_TARGETS = True
 
 # -------------------------------
 # Cloud-mask image settings
@@ -181,24 +182,38 @@ def load_norm_stats(path):
     with open(path, "r") as f:
         stats = json.load(f)
 
-    mean = pd.Series(stats["mean"], dtype="float32")
-    std = pd.Series(stats["std"], dtype="float32")
+    feature_mean = pd.Series(
+        stats.get("feature_mean", stats.get("mean")),
+        dtype="float32",
+    )
+    feature_std = pd.Series(
+        stats.get("feature_std", stats.get("std")),
+        dtype="float32",
+    )
+
+    target_mean_data = stats.get("target_mean", stats.get("mean"))
+    target_std_data = stats.get("target_std", stats.get("std"))
+    target_mean = pd.Series(target_mean_data, dtype="float32")
+    target_std = pd.Series(target_std_data, dtype="float32")
+    normalize_targets = bool(stats.get("normalize_targets", NORMALIZE_TARGETS))
 
     print(f"Loaded normalization statistics from: {path}")
 
     return {
-        "mean": mean,
-        "std": std,
+        "feature_mean": feature_mean,
+        "feature_std": feature_std,
+        "target_mean": target_mean,
+        "target_std": target_std,
+        "normalize_targets": normalize_targets,
+        # Legacy aliases expected by older dataset/helper code.
+        "mean": feature_mean,
+        "std": feature_std,
     }
 
 
 def inverse_normalize_ghi(values, norm_stats):
     """
-    Converts normalized GHI values back to original W/m² scale.
-
-    The current dataset leaves target GHI unnormalized, so evaluation does not
-    call this helper. It is kept only for older checkpoints/datasets that may
-    have normalized targets.
+    Converts normalized GHI values back to original W/m^2 scale.
 
     values:
         numpy array with shape (N, horizon, 1)
@@ -206,10 +221,20 @@ def inverse_normalize_ghi(values, norm_stats):
     norm_stats:
         dictionary containing mean and std for GHI
     """
-    ghi_mean = float(norm_stats["mean"]["ghi"])
-    ghi_std = float(norm_stats["std"]["ghi"])
+    ghi_mean = float(norm_stats["target_mean"]["ghi"])
+    ghi_std = float(norm_stats["target_std"]["ghi"])
 
     return values * ghi_std + ghi_mean
+
+
+def can_inverse_normalize_ghi(norm_stats):
+    return (
+        norm_stats is not None
+        and bool(norm_stats.get("normalize_targets", False))
+        and TARGET_COLS == ["ghi"]
+        and "ghi" in norm_stats["target_mean"]
+        and "ghi" in norm_stats["target_std"]
+    )
 
 
 # ============================================================
@@ -388,6 +413,7 @@ def evaluate_split(
 
     prediction_rows = []
     global_sample_index = 0
+    has_physical_scale = can_inverse_normalize_ghi(norm_stats)
 
     loop = tqdm(loader, total=len(loader), desc=f"Evaluating {split_name}", leave=True)
 
@@ -417,6 +443,12 @@ def evaluate_split(
 
             preds_np = preds.detach().cpu().numpy()
             targets_np = targets.detach().cpu().numpy()
+            preds_wm2_np = None
+            targets_wm2_np = None
+
+            if has_physical_scale:
+                preds_wm2_np = inverse_normalize_ghi(preds_np, norm_stats)
+                targets_wm2_np = inverse_normalize_ghi(targets_np, norm_stats)
 
             all_preds.append(preds_np)
             all_targets.append(targets_np)
@@ -441,6 +473,14 @@ def evaluate_split(
                         pred_value = float(preds_np[b, h, 0])
                         target_value = float(targets_np[b, h, 0])
                         error = pred_value - target_value
+                        pred_wm2 = None
+                        target_wm2 = None
+                        error_wm2 = None
+
+                        if has_physical_scale:
+                            pred_wm2 = float(preds_wm2_np[b, h, 0])
+                            target_wm2 = float(targets_wm2_np[b, h, 0])
+                            error_wm2 = pred_wm2 - target_wm2
 
                         prediction_rows.append(
                             {
@@ -450,11 +490,52 @@ def evaluate_split(
                                 "input_end_time": input_end_time,
                                 "target_time": target_time,
                                 "horizon_step": h + 1,
-                                "predicted_ghi": pred_value,
-                                "target_ghi": target_value,
-                                "error": error,
-                                "absolute_error": abs(error),
-                                "squared_error": error ** 2,
+                                "value_scale": (
+                                    "wm2" if has_physical_scale else "normalized"
+                                ),
+                                "predicted_ghi": (
+                                    pred_wm2
+                                    if pred_wm2 is not None
+                                    else pred_value
+                                ),
+                                "target_ghi": (
+                                    target_wm2
+                                    if target_wm2 is not None
+                                    else target_value
+                                ),
+                                "error": (
+                                    error_wm2
+                                    if error_wm2 is not None
+                                    else error
+                                ),
+                                "absolute_error": (
+                                    abs(error_wm2)
+                                    if error_wm2 is not None
+                                    else abs(error)
+                                ),
+                                "squared_error": (
+                                    error_wm2 ** 2
+                                    if error_wm2 is not None
+                                    else error ** 2
+                                ),
+                                "predicted_ghi_normalized": pred_value,
+                                "target_ghi_normalized": target_value,
+                                "error_normalized": error,
+                                "absolute_error_normalized": abs(error),
+                                "squared_error_normalized": error ** 2,
+                                "predicted_ghi_wm2": pred_wm2,
+                                "target_ghi_wm2": target_wm2,
+                                "error_wm2": error_wm2,
+                                "absolute_error_wm2": (
+                                    abs(error_wm2)
+                                    if error_wm2 is not None
+                                    else None
+                                ),
+                                "squared_error_wm2": (
+                                    error_wm2 ** 2
+                                    if error_wm2 is not None
+                                    else None
+                                ),
                             }
                         )
 
@@ -470,14 +551,32 @@ def evaluate_split(
 
     per_horizon_rows = compute_per_horizon_metrics(all_preds, all_targets)
 
-    # Targets are already kept in original W/m^2 scale by dataset_new.py, so
-    # the metrics above are the final physical-scale metrics.
-    overall_metrics_unnorm = None
+    overall_metrics_wm2 = None
+    per_horizon_rows_wm2 = None
+
+    if has_physical_scale:
+        all_preds_wm2 = inverse_normalize_ghi(all_preds, norm_stats)
+        all_targets_wm2 = inverse_normalize_ghi(all_targets, norm_stats)
+
+        overall_metrics_wm2 = compute_forecasting_metrics(
+            all_preds_wm2,
+            all_targets_wm2,
+        )
+        overall_metrics_wm2["loss_normalized"] = float(total_loss / total_samples)
+        overall_metrics_wm2["num_samples"] = int(all_preds_wm2.shape[0])
+        overall_metrics_wm2["num_forecast_points"] = int(
+            all_preds_wm2.shape[0] * all_preds_wm2.shape[1]
+        )
+
+        per_horizon_rows_wm2 = compute_per_horizon_metrics(
+            all_preds_wm2,
+            all_targets_wm2,
+        )
 
     if save_predictions_path is not None:
         save_dict_rows_csv(prediction_rows, save_predictions_path)
 
-    return overall_metrics, per_horizon_rows, overall_metrics_unnorm
+    return overall_metrics, per_horizon_rows, overall_metrics_wm2, per_horizon_rows_wm2
 
 
 # ============================================================
@@ -504,6 +603,7 @@ def build_datasets(norm_stats):
         root_dir=ROOT_DIR,
         mask_mode=MASK_MODE,
         apply_rotation=False,
+        normalize_targets=NORMALIZE_TARGETS,
     )
 
     if norm_stats is None:
@@ -524,6 +624,7 @@ def build_datasets(norm_stats):
         mask_mode=MASK_MODE,
         apply_rotation=False,
         normalization_stats=norm_stats,
+        normalize_targets=NORMALIZE_TARGETS,
     )
 
     test_ds = None
@@ -544,6 +645,7 @@ def build_datasets(norm_stats):
             mask_mode=MASK_MODE,
             apply_rotation=False,
             normalization_stats=norm_stats,
+            normalize_targets=NORMALIZE_TARGETS,
         )
 
     return {
@@ -635,6 +737,7 @@ def main():
     print(f"Forecast horizon: {HORIZON} minutes")
     print(f"Time-series features: {FEATURE_COLS}")
     print(f"Target columns: {TARGET_COLS}")
+    print(f"Normalize targets: {NORMALIZE_TARGETS}")
     print("Ignored columns: raw_image_path, optical_flow_image_path, temp, pressure, delta_ghi")
     print("Mask convention: R=low cloud, G=mid cloud, B=high cloud, black=sky")
 
@@ -651,8 +754,10 @@ def main():
     norm_stats = load_norm_stats(NORM_STATS_PATH)
 
     if norm_stats is not None:
-        print(f"GHI input mean from training stats: {float(norm_stats['mean']['ghi']):.5f}")
-        print(f"GHI input std from training stats: {float(norm_stats['std']['ghi']):.5f}")
+        print(f"GHI input mean from training stats: {float(norm_stats['feature_mean']['ghi']):.5f}")
+        print(f"GHI input std from training stats: {float(norm_stats['feature_std']['ghi']):.5f}")
+        print(f"GHI target mean from training stats: {float(norm_stats['target_mean']['ghi']):.5f}")
+        print(f"GHI target std from training stats: {float(norm_stats['target_std']['ghi']):.5f}")
 
     # -------------------------------
     # Build datasets
@@ -662,8 +767,10 @@ def main():
     if norm_stats is None:
         norm_stats = datasets["train"].normalization_stats
         print("Using train dataset normalization stats for input features.")
-        print(f"GHI input mean from training stats: {float(norm_stats['mean']['ghi']):.5f}")
-        print(f"GHI input std from training stats: {float(norm_stats['std']['ghi']):.5f}")
+        print(f"GHI input mean from training stats: {float(norm_stats['feature_mean']['ghi']):.5f}")
+        print(f"GHI input std from training stats: {float(norm_stats['feature_std']['ghi']):.5f}")
+        print(f"GHI target mean from training stats: {float(norm_stats['target_mean']['ghi']):.5f}")
+        print(f"GHI target std from training stats: {float(norm_stats['target_std']['ghi']):.5f}")
 
     # -------------------------------
     # DataLoaders
@@ -716,6 +823,7 @@ def main():
         "csv_path": CSV_PATH,
         "feature_cols": FEATURE_COLS,
         "target_cols": TARGET_COLS,
+        "normalize_targets": NORMALIZE_TARGETS,
         "ignored_columns": [
             "raw_image_path",
             "optical_flow_image_path",
@@ -741,7 +849,12 @@ def main():
                 f"predictions_{split_name}.csv",
             )
 
-        metrics, per_horizon_rows, _ = evaluate_split(
+        (
+            metrics_norm,
+            per_horizon_rows_norm,
+            metrics_wm2,
+            per_horizon_rows_wm2,
+        ) = evaluate_split(
             model=model,
             loader=loader,
             device=device,
@@ -751,44 +864,83 @@ def main():
             save_predictions_path=prediction_path,
         )
 
-        print(
-            f"{split_name.upper()} | "
-            f"Samples: {metrics['num_samples']} | "
-            f"Loss: {metrics['loss']:.5f} | "
-            f"RMSE: {metrics['rmse']:.3f} W/m² | "
-            f"MAE: {metrics['mae']:.3f} W/m² | "
-            f"MBE: {metrics['mbe']:.3f} W/m² | "
-            f"R2: {metrics['r2']:.4f}"
-        )
+        if metrics_wm2 is not None:
+            print(
+                f"{split_name.upper()} W/m^2 | "
+                f"Samples: {metrics_wm2['num_samples']} | "
+                f"Loss(norm): {metrics_norm['loss']:.5f} | "
+                f"RMSE: {metrics_wm2['rmse']:.3f} | "
+                f"MAE: {metrics_wm2['mae']:.3f} | "
+                f"MBE: {metrics_wm2['mbe']:.3f} | "
+                f"R2: {metrics_wm2['r2']:.4f}"
+            )
+            print(
+                f"{split_name.upper()} normalized | "
+                f"RMSE: {metrics_norm['rmse']:.5f} | "
+                f"MAE: {metrics_norm['mae']:.5f} | "
+                f"MBE: {metrics_norm['mbe']:.5f}"
+            )
+        else:
+            print(
+                f"{split_name.upper()} normalized | "
+                f"Samples: {metrics_norm['num_samples']} | "
+                f"Loss: {metrics_norm['loss']:.5f} | "
+                f"RMSE: {metrics_norm['rmse']:.5f} | "
+                f"MAE: {metrics_norm['mae']:.5f} | "
+                f"MBE: {metrics_norm['mbe']:.5f} | "
+                f"R2: {metrics_norm['r2']:.4f}"
+            )
 
         summary_row = {
             "split": split_name,
-            "num_samples": metrics["num_samples"],
-            "num_forecast_points": metrics["num_forecast_points"],
-            "loss": metrics["loss"],
-            "mse": metrics["mse"],
-            "rmse": metrics["rmse"],
-            "mae": metrics["mae"],
-            "mbe": metrics["mbe"],
-            "r2": metrics["r2"],
+            "num_samples": metrics_norm["num_samples"],
+            "num_forecast_points": metrics_norm["num_forecast_points"],
+            "loss_normalized": metrics_norm["loss"],
+            "mse_normalized": metrics_norm["mse"],
+            "rmse_normalized": metrics_norm["rmse"],
+            "mae_normalized": metrics_norm["mae"],
+            "mbe_normalized": metrics_norm["mbe"],
+            "r2_normalized": metrics_norm["r2"],
+            "mse_wm2": metrics_wm2["mse"] if metrics_wm2 is not None else None,
+            "rmse_wm2": metrics_wm2["rmse"] if metrics_wm2 is not None else None,
+            "mae_wm2": metrics_wm2["mae"] if metrics_wm2 is not None else None,
+            "mbe_wm2": metrics_wm2["mbe"] if metrics_wm2 is not None else None,
+            "r2_wm2": metrics_wm2["r2"] if metrics_wm2 is not None else None,
         }
 
         summary_rows.append(summary_row)
 
-        per_horizon_path = os.path.join(
+        per_horizon_norm_path = os.path.join(
             EVAL_OUTPUT_DIR,
-            f"per_horizon_metrics_{split_name}.csv",
+            f"per_horizon_metrics_normalized_{split_name}.csv",
         )
 
-        for row in per_horizon_rows:
+        for row in per_horizon_rows_norm:
             row["split"] = split_name
 
-        save_dict_rows_csv(per_horizon_rows, per_horizon_path)
+        save_dict_rows_csv(per_horizon_rows_norm, per_horizon_norm_path)
+
+        per_horizon_wm2_path = None
+
+        if per_horizon_rows_wm2 is not None:
+            per_horizon_wm2_path = os.path.join(
+                EVAL_OUTPUT_DIR,
+                f"per_horizon_metrics_wm2_{split_name}.csv",
+            )
+
+            for row in per_horizon_rows_wm2:
+                row["split"] = split_name
+
+            save_dict_rows_csv(per_horizon_rows_wm2, per_horizon_wm2_path)
 
         all_results["splits"][split_name] = {
-            "overall_metrics": metrics,
-            "per_horizon_metrics": per_horizon_rows,
+            "overall_metrics_normalized": metrics_norm,
+            "overall_metrics_wm2": metrics_wm2,
+            "per_horizon_metrics_normalized": per_horizon_rows_norm,
+            "per_horizon_metrics_wm2": per_horizon_rows_wm2,
             "predictions_csv": prediction_path,
+            "per_horizon_normalized_csv": per_horizon_norm_path,
+            "per_horizon_wm2_csv": per_horizon_wm2_path,
         }
 
     # -------------------------------
@@ -804,26 +956,37 @@ def main():
     # Print final table
     # -------------------------------
     print("\n================ EVALUATION SUMMARY ================")
-    print("Units: RMSE, MAE, and MBE are in W/m². MSE is in (W/m²)².")
+    print("Physical metrics are in W/m^2. Loss is normalized MSE.")
     print(
         f"{'split':<10} "
         f"{'samples':>10} "
-        f"{'loss':>12} "
-        f"{'rmse':>12} "
-        f"{'mae':>12} "
-        f"{'mbe':>12} "
+        f"{'loss_norm':>12} "
+        f"{'rmse_wm2':>12} "
+        f"{'mae_wm2':>12} "
+        f"{'mbe_wm2':>12} "
         f"{'r2':>10}"
     )
 
     for row in summary_rows:
+        rmse = row["rmse_wm2"]
+        mae = row["mae_wm2"]
+        mbe = row["mbe_wm2"]
+        r2 = row["r2_wm2"]
+
+        if rmse is None:
+            rmse = row["rmse_normalized"]
+            mae = row["mae_normalized"]
+            mbe = row["mbe_normalized"]
+            r2 = row["r2_normalized"]
+
         print(
             f"{row['split']:<10} "
             f"{row['num_samples']:>10} "
-            f"{row['loss']:>12.5f} "
-            f"{row['rmse']:>12.3f} "
-            f"{row['mae']:>12.3f} "
-            f"{row['mbe']:>12.3f} "
-            f"{row['r2']:>10.4f}"
+            f"{row['loss_normalized']:>12.5f} "
+            f"{rmse:>12.3f} "
+            f"{mae:>12.3f} "
+            f"{mbe:>12.3f} "
+            f"{r2:>10.4f}"
         )
 
     print("\nEvaluation complete")
