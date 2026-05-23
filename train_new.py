@@ -90,7 +90,7 @@ TARGET_DIM = 1
 # Training settings
 # -------------------------------
 BATCH_SIZE = 32
-NUM_EPOCHS = 50
+NUM_EPOCHS = 1
 NUM_WORKERS = 4
 
 LR_VISION = 1e-5
