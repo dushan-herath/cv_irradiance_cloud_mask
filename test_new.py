@@ -33,7 +33,7 @@ ROOT_DIR = ""
 #
 # "cloud_mask"     -> evaluate cloud-mask images + time-series
 # "original_image" -> evaluate original sky images + time-series
-VISION_INPUT_MODE = "original_image"
+VISION_INPUT_MODE = "cloud_mask"
 
 # Must match the folder used during training.
 # Cloud mask     -> "runs/cloud_mask_time_series_target_norm"

@@ -34,7 +34,7 @@ ROOT_DIR = ""
 # -------------------------------
 # "cloud_mask"     -> cloud-mask images + time-series
 # "original_image" -> original sky images + time-series
-VISION_INPUT_MODE = "original_image"
+VISION_INPUT_MODE = "cloud_mask"
 
 # Recommended output directories:
 # Cloud mask     -> "runs/cloud_mask_time_series_target_norm"
@@ -80,7 +80,7 @@ IMG_SIZE = 224
 VISION_MODEL_NAME = "vit_tiny_patch16_224"
 VISION_IN_CHANS = 3
 PRETRAINED = True
-FREEZE_VISION = True
+FREEZE_VISION = False
 
 D_MODEL = 128
 FUSED_DIM = 128
@@ -90,7 +90,7 @@ TARGET_DIM = 1
 # Training settings
 # -------------------------------
 BATCH_SIZE = 32
-NUM_EPOCHS = 1
+NUM_EPOCHS = 50
 NUM_WORKERS = 4
 
 LR_VISION = 1e-5
