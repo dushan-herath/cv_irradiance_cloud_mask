@@ -34,7 +34,7 @@ ROOT_DIR = ""
 # -------------------------------
 # "real" -> cloud-mask-only model
 # "zero" -> same model with zero mask images for an ablation baseline
-MASK_MODE = "real"
+MASK_MODE = "zero"
 
 # Recommended output directories:
 # Mask only -> "runs/cloud_mask_only_target_norm"

@@ -33,7 +33,7 @@ ROOT_DIR = ""
 #
 # "real" -> evaluate cloud-mask-only model
 # "zero" -> evaluate zero-mask baseline
-MASK_MODE = "real"
+MASK_MODE = "zero"
 
 # Must match the folder used during training.
 # Mask only -> "runs/cloud_mask_only_target_norm"
