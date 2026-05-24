@@ -92,7 +92,7 @@ IMG_SIZE = 224
 # Model settings
 # Must match training.
 # -------------------------------
-VISION_MODEL_NAME = "vit_base_patch16_224"
+VISION_MODEL_NAME = "vit_tiny_patch16_224"
 VISION_IN_CHANS = 3
 
 # During evaluation we do not need to load ImageNet weights,
