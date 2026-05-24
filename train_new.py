@@ -32,14 +32,14 @@ ROOT_DIR = ""
 # -------------------------------
 # Experiment mode
 # -------------------------------
-# "real" -> cloud-mask-only model
-# "zero" -> same model with zero mask images for an ablation baseline
-MASK_MODE = "zero"
+# "cloud_mask"     -> cloud-mask images + time-series
+# "original_image" -> original sky images + time-series
+VISION_INPUT_MODE = "cloud_mask"
 
 # Recommended output directories:
-# Mask only -> "runs/cloud_mask_only_target_norm"
-# Zero mask -> "runs/zero_mask_baseline_target_norm"
-OUTPUT_DIR = "runs/cloud_mask_only_target_norm"
+# Cloud mask     -> "runs/cloud_mask_time_series_target_norm"
+# Original image -> "runs/original_image_time_series_target_norm"
+OUTPUT_DIR = f"runs/{VISION_INPUT_MODE}_time_series_target_norm"
 
 # -------------------------------
 # Dataset split
@@ -64,11 +64,11 @@ TARGET_COLS = ["ghi"]
 NORMALIZE_TARGETS = True
 
 # -------------------------------
-# Cloud-mask image settings
+# Vision image settings
 # -------------------------------
 IMG_SIZE = 224
 
-# Mask convention:
+# Cloud-mask convention:
 # R = low cloud
 # G = mid cloud
 # B = high cloud
@@ -78,7 +78,7 @@ IMG_SIZE = 224
 # Model settings
 # -------------------------------
 VISION_MODEL_NAME = "vit_base_patch16_224"
-MASK_IN_CHANS = 3
+VISION_IN_CHANS = 3
 PRETRAINED = True
 FREEZE_VISION = False
 
@@ -257,7 +257,6 @@ def train_one_epoch(
     criterion,
     device,
     scaler,
-    use_cloud_mask,
     norm_stats=None,
     max_grad_norm=None,
 ):
@@ -272,13 +271,13 @@ def train_one_epoch(
     loop = tqdm(loader, total=len(loader), desc="Training", leave=True)
 
     for i, batch in enumerate(loop):
-        mask_seq, ts_seq, targets, *_ = batch
+        vision_seq, ts_seq, targets, *_ = batch
 
-        mask_seq = mask_seq.to(device, non_blocking=True)
+        vision_seq = vision_seq.to(device, non_blocking=True)
         ts_seq = ts_seq.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
-        batch_size = mask_seq.size(0)
+        batch_size = vision_seq.size(0)
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -286,9 +285,8 @@ def train_one_epoch(
 
         with torch.cuda.amp.autocast(enabled=use_amp):
             preds = model(
-                cloud_mask=mask_seq,
+                vision=vision_seq,
                 ts=ts_seq,
-                use_cloud_mask=use_cloud_mask,
             )
 
             loss = criterion(preds, targets)
@@ -339,7 +337,6 @@ def evaluate_one_epoch(
     loader,
     criterion,
     device,
-    use_cloud_mask,
     norm_stats=None,
     desc="Validation",
 ):
@@ -355,18 +352,17 @@ def evaluate_one_epoch(
 
     with torch.no_grad():
         for i, batch in enumerate(loop):
-            mask_seq, ts_seq, targets, *_ = batch
+            vision_seq, ts_seq, targets, *_ = batch
 
-            mask_seq = mask_seq.to(device, non_blocking=True)
+            vision_seq = vision_seq.to(device, non_blocking=True)
             ts_seq = ts_seq.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
-            batch_size = mask_seq.size(0)
+            batch_size = vision_seq.size(0)
 
             preds = model(
-                cloud_mask=mask_seq,
+                vision=vision_seq,
                 ts=ts_seq,
-                use_cloud_mask=use_cloud_mask,
             )
 
             loss = criterion(preds, targets)
@@ -483,7 +479,7 @@ def save_checkpoint(
             "csv_path": CSV_PATH,
             "root_dir": ROOT_DIR,
             "output_dir": OUTPUT_DIR,
-            "mask_mode": MASK_MODE,
+            "vision_input_mode": VISION_INPUT_MODE,
             "val_ratio": VAL_RATIO,
             "test_ratio": TEST_RATIO,
             "img_seq_len": IMG_SEQ_LEN,
@@ -494,7 +490,7 @@ def save_checkpoint(
             "normalize_targets": NORMALIZE_TARGETS,
             "img_size": IMG_SIZE,
             "vision_model_name": VISION_MODEL_NAME,
-            "mask_in_chans": MASK_IN_CHANS,
+            "vision_in_chans": VISION_IN_CHANS,
             "pretrained": PRETRAINED,
             "freeze_vision": FREEZE_VISION,
             "d_model": D_MODEL,
@@ -545,8 +541,6 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    use_cloud_mask = MASK_MODE == "real"
-
     print("\n==============================")
     print("Solar Irradiance Forecasting")
     print("==============================")
@@ -554,23 +548,24 @@ def main():
     print(f"CSV path: {CSV_PATH}")
     print(f"Root directory: {ROOT_DIR}")
     print(f"Output directory: {OUTPUT_DIR}")
-    print(f"Mask mode: {MASK_MODE}")
-    print(f"Use cloud-mask input: {use_cloud_mask}")
-    print(f"Cloud-mask sequence length: {IMG_SEQ_LEN}")
+    print(f"Vision input mode: {VISION_INPUT_MODE}")
+    print(f"Vision sequence length: {IMG_SEQ_LEN}")
     print(f"Time-series length: {TS_SEQ_LEN}")
     print(f"Forecast horizon: {HORIZON} minutes")
     print(f"Time-series features: {FEATURE_COLS}")
     print(f"Target columns: {TARGET_COLS}")
     print(f"Normalize targets: {NORMALIZE_TARGETS}")
     print("Ignored columns: raw_image_path, optical_flow_image_path, temp, pressure, delta_ghi")
-    print("Mask convention: R=low cloud, G=mid cloud, B=high cloud, black=sky")
+    print("Cloud-mask convention: R=low cloud, G=mid cloud, B=high cloud, black=sky")
 
-    if MASK_MODE == "real":
-        print("Experiment: CLOUD-MASK-ONLY vision input")
-    elif MASK_MODE == "zero":
-        print("Experiment: ZERO-MASK baseline")
+    if VISION_INPUT_MODE == "cloud_mask":
+        print("Experiment: CLOUD MASK + time-series")
+    elif VISION_INPUT_MODE == "original_image":
+        print("Experiment: ORIGINAL IMAGE + time-series")
     else:
-        raise ValueError("MASK_MODE must be either 'real' or 'zero'")
+        raise ValueError(
+            "VISION_INPUT_MODE must be either 'cloud_mask' or 'original_image'"
+        )
 
     # -------------------------------
     # Dataset
@@ -587,7 +582,7 @@ def main():
         target_cols=TARGET_COLS,
         img_size=IMG_SIZE,
         root_dir=ROOT_DIR,
-        mask_mode=MASK_MODE,
+        vision_input_mode=VISION_INPUT_MODE,
         apply_rotation=APPLY_ROTATION,
         normalize_targets=NORMALIZE_TARGETS,
     )
@@ -604,7 +599,7 @@ def main():
         target_cols=TARGET_COLS,
         img_size=IMG_SIZE,
         root_dir=ROOT_DIR,
-        mask_mode=MASK_MODE,
+        vision_input_mode=VISION_INPUT_MODE,
         apply_rotation=False,
         normalization_stats=train_ds.normalization_stats,
         normalize_targets=NORMALIZE_TARGETS,
@@ -625,7 +620,7 @@ def main():
             target_cols=TARGET_COLS,
             img_size=IMG_SIZE,
             root_dir=ROOT_DIR,
-            mask_mode=MASK_MODE,
+            vision_input_mode=VISION_INPUT_MODE,
             apply_rotation=False,
             normalization_stats=train_ds.normalization_stats,
             normalize_targets=NORMALIZE_TARGETS,
@@ -678,7 +673,8 @@ def main():
         ts_feat_dim=len(FEATURE_COLS),
         img_size=IMG_SIZE,
         vision_model_name=VISION_MODEL_NAME,
-        mask_in_chans=MASK_IN_CHANS,
+        vision_in_chans=VISION_IN_CHANS,
+        vision_input_mode=VISION_INPUT_MODE,
         pretrained=PRETRAINED,
         freeze_vision=FREEZE_VISION,
         d_model=D_MODEL,
@@ -786,7 +782,6 @@ def main():
             criterion=criterion,
             device=device,
             scaler=scaler,
-            use_cloud_mask=use_cloud_mask,
             norm_stats=train_ds.normalization_stats,
             max_grad_norm=MAX_GRAD_NORM,
         )
@@ -796,7 +791,6 @@ def main():
             loader=val_loader,
             criterion=criterion,
             device=device,
-            use_cloud_mask=use_cloud_mask,
             norm_stats=train_ds.normalization_stats,
             desc="Validation",
         )
@@ -855,8 +849,8 @@ def main():
                     "best_val_rmse": best_val_rmse,
                     "best_val_loss": best_val_loss,
                     "val_metrics": val_metrics,
-                    "mask_mode": MASK_MODE,
-                    "mask_in_chans": MASK_IN_CHANS,
+                    "vision_input_mode": VISION_INPUT_MODE,
+                    "vision_in_chans": VISION_IN_CHANS,
                     "feature_cols": FEATURE_COLS,
                     "target_cols": TARGET_COLS,
                     "normalize_targets": NORMALIZE_TARGETS,
@@ -901,14 +895,13 @@ def main():
         loader=val_loader,
         criterion=criterion,
         device=device,
-        use_cloud_mask=use_cloud_mask,
         norm_stats=train_ds.normalization_stats,
         desc="Final Validation",
     )
 
     final_results = {
-        "experiment": "cloud_mask_only" if use_cloud_mask else "zero_mask_baseline",
-        "mask_mode": MASK_MODE,
+        "experiment": f"{VISION_INPUT_MODE}_time_series",
+        "vision_input_mode": VISION_INPUT_MODE,
         "csv_path": CSV_PATH,
         "feature_cols": FEATURE_COLS,
         "target_cols": TARGET_COLS,
@@ -923,7 +916,7 @@ def main():
         "img_seq_len": IMG_SEQ_LEN,
         "ts_seq_len": TS_SEQ_LEN,
         "horizon": HORIZON,
-        "mask_in_chans": MASK_IN_CHANS,
+        "vision_in_chans": VISION_IN_CHANS,
         "best_val_rmse": best_val_rmse,
         "best_val_rmse_wm2": (
             final_val_metrics.get("rmse_wm2")
@@ -940,7 +933,6 @@ def main():
             loader=test_loader,
             criterion=criterion,
             device=device,
-            use_cloud_mask=use_cloud_mask,
             norm_stats=train_ds.normalization_stats,
             desc="Final Test",
         )

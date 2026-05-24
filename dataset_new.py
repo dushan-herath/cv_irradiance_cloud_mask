@@ -24,7 +24,7 @@ class IrradianceForecastDataset(Dataset):
         time_col: str = "timestamp",
         normalization_stats: dict = None,
         root_dir: str = "",
-        mask_mode: str = "real",
+        vision_input_mode: str = "cloud_mask",
         apply_rotation: bool = True,
         normalize_targets: bool = True,
     ):
@@ -32,12 +32,10 @@ class IrradianceForecastDataset(Dataset):
         Dataset for solar irradiance forecasting.
 
         Inputs:
-            Cloud-mask image sequence:
+            Vision image sequence:
                 shape = (T_img, 3, H, W)
-                R = low cloud
-                G = mid cloud
-                B = high cloud
-                black = clear sky
+                cloud_mask     -> RGB cloud-type mask
+                original_image -> RGB sky image
 
             Time-series sequence:
                 shape = (T_ts, 3)
@@ -47,9 +45,9 @@ class IrradianceForecastDataset(Dataset):
             Future GHI sequence:
                 shape = (horizon, 1)
 
-        mask_mode:
-            "real" -> load real cloud-mask image
-            "zero" -> return zero mask image for an ablation baseline
+        vision_input_mode:
+            "cloud_mask"     -> load cloud-mask images
+            "original_image" -> load original sky images
 
         normalize_targets:
             True -> train on normalized target GHI and invert back to W/m^2
@@ -102,25 +100,33 @@ class IrradianceForecastDataset(Dataset):
         self.img_size = img_size
         self.time_col = time_col
         self.root_dir = root_dir
-        self.mask_mode = mask_mode
+        self.vision_input_mode = vision_input_mode
         self.apply_rotation = apply_rotation
         self.normalize_targets = normalize_targets
 
         self.feature_cols = feature_cols or ["ghi", "dni", "dhi"]
         self.target_cols = target_cols or ["ghi"]
 
-        # Vision input path column. The original sky-image path is not used.
+        self.image_col = "raw_image_path"
         self.mask_col = "cloud_mask_image_path"
 
         self.max_lookback = max(img_seq_len, ts_seq_len)
 
-        if self.mask_mode not in ["real", "zero"]:
-            raise ValueError("mask_mode must be either 'real' or 'zero'")
+        if self.vision_input_mode not in ["cloud_mask", "original_image"]:
+            raise ValueError(
+                "vision_input_mode must be either 'cloud_mask' or 'original_image'"
+            )
 
         # -------------------------------
         # Check required columns
         # -------------------------------
-        required_cols = [self.mask_col, self.time_col] + self.feature_cols + self.target_cols
+        vision_col = (
+            self.mask_col
+            if self.vision_input_mode == "cloud_mask"
+            else self.image_col
+        )
+
+        required_cols = [vision_col, self.time_col] + self.feature_cols + self.target_cols
 
         missing_cols = [c for c in required_cols if c not in self.df.columns]
         if missing_cols:
@@ -206,11 +212,16 @@ class IrradianceForecastDataset(Dataset):
             self.target_df = (self.target_df - target_mean) / target_std
 
         # -------------------------------
-        # Cloud-mask image preprocessing
+        # Vision image preprocessing
         # -------------------------------
-        self.mask_resize = transforms.Resize(
+        self.vision_resize = transforms.Resize(
             (img_size, img_size),
             interpolation=TF.InterpolationMode.NEAREST,
+        )
+        self.image_resize = transforms.Resize((img_size, img_size))
+        self.image_normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
         )
 
         # -------------------------------
@@ -218,15 +229,16 @@ class IrradianceForecastDataset(Dataset):
         # -------------------------------
         print(f"\nDataset initialized ({split.upper()}): {len(self)} samples")
         print(f"CSV path: {csv_path}")
-        print(f"Cloud-mask sequence length: {img_seq_len}")
+        print(f"Vision sequence length: {img_seq_len}")
         print(f"Time-series length: {ts_seq_len}")
         print(f"Forecast horizon: {horizon}")
         print(f"Time-series features: {self.feature_cols}")
         print(f"Target columns: {self.target_cols}")
         print(f"Normalize targets: {self.normalize_targets}")
-        print(f"Mask mode: {self.mask_mode}")
+        print(f"Vision input mode: {self.vision_input_mode}")
+        print(f"Vision column: {vision_col}")
         print(f"Mask column: {self.mask_col}")
-        print("Vision input: cloud masks only; raw sky images are not loaded")
+        print(f"Image column: {self.image_col}")
         print("Mask convention: R=low cloud, G=mid cloud, B=high cloud, black=sky")
 
     def __len__(self):
@@ -257,14 +269,19 @@ class IrradianceForecastDataset(Dataset):
         converted into a binary 3-channel tensor.
         """
         mask = Image.open(path).convert("RGB")
-        mask = self.mask_resize(mask)
+        mask = self.vision_resize(mask)
         return mask
+
+    def _load_original_image(self, path):
+        image = Image.open(path).convert("RGB")
+        image = self.image_resize(image)
+        return image
 
     def __getitem__(self, idx):
         # -------------------------------
         # Select windows
         # -------------------------------
-        mask_window = self.df.iloc[
+        vision_window = self.df.iloc[
             idx + self.ts_seq_len - self.img_seq_len : idx + self.ts_seq_len
         ]
 
@@ -277,50 +294,51 @@ class IrradianceForecastDataset(Dataset):
         ]
 
         # -------------------------------
-        # One random rotation per sequence
-        # Rotation is applied to the mask sequence using nearest-neighbor
-        # interpolation to preserve discrete cloud-type colors.
+        # One random rotation per sequence. Masks use nearest-neighbor
+        # interpolation; original images use bilinear interpolation.
         # -------------------------------
         if self.split == "train" and self.apply_rotation:
             angle = random.uniform(-180, 180)
         else:
             angle = 0.0
 
-        mask_seq = []
+        vision_seq = []
+        vision_col = (
+            self.mask_col
+            if self.vision_input_mode == "cloud_mask"
+            else self.image_col
+        )
 
-        for mask_p in mask_window[self.mask_col].values:
-            mask_path = self._resolve_path(mask_p)
+        for vision_p in vision_window[vision_col].values:
+            vision_path = self._resolve_path(vision_p)
 
-            # ---- Load cloud-mask image ----
-            cloud_mask = self._load_cloud_mask(mask_path)
+            if self.vision_input_mode == "cloud_mask":
+                vision_img = self._load_cloud_mask(vision_path)
+                rotation_interpolation = TF.InterpolationMode.NEAREST
+            else:
+                vision_img = self._load_original_image(vision_path)
+                rotation_interpolation = TF.InterpolationMode.BILINEAR
 
             # ---- Augmentation ----
             if angle != 0.0:
-                cloud_mask = TF.rotate(
-                    cloud_mask,
+                vision_img = TF.rotate(
+                    vision_img,
                     angle=angle,
-                    interpolation=TF.InterpolationMode.NEAREST,
+                    interpolation=rotation_interpolation,
                     fill=0,
                 )
 
-            # ---- Mask to tensor ----
-            if self.mask_mode == "real":
-                mask_tensor = TF.to_tensor(cloud_mask)
-
-                # Convert possible antialiasing/compression values into
-                # binary RGB cloud-type channels.
-                mask_tensor = (mask_tensor > 0.5).float()
+            if self.vision_input_mode == "cloud_mask":
+                vision_tensor = TF.to_tensor(vision_img)
+                # Preserve the RGB cloud-type channels as binary indicators.
+                vision_tensor = (vision_tensor > 0.5).float()
             else:
-                mask_tensor = torch.zeros(
-                    3,
-                    self.img_size,
-                    self.img_size,
-                    dtype=torch.float32,
-                )
+                vision_tensor = TF.to_tensor(vision_img)
+                vision_tensor = self.image_normalize(vision_tensor)
 
-            mask_seq.append(mask_tensor)
+            vision_seq.append(vision_tensor)
 
-        mask_seq = torch.stack(mask_seq)    # (T_img, 3, H, W)
+        vision_seq = torch.stack(vision_seq)    # (T_img, 3, H, W)
 
         # -------------------------------
         # Time-series inputs
@@ -363,7 +381,7 @@ class IrradianceForecastDataset(Dataset):
             ts_time = []
             tgt_time = []
 
-        return mask_seq, ts_seq, target_seq, ts_time, tgt_time
+        return vision_seq, ts_seq, target_seq, ts_time, tgt_time
 
 
 # ======================================================================
@@ -386,7 +404,7 @@ if __name__ == "__main__":
         target_cols=["ghi"],
         img_size=224,
         root_dir="",
-        mask_mode="real",
+        vision_input_mode="cloud_mask",
     )
 
     val_dataset = IrradianceForecastDataset(
@@ -401,13 +419,13 @@ if __name__ == "__main__":
         target_cols=["ghi"],
         img_size=224,
         root_dir="",
-        mask_mode="real",
+        vision_input_mode="cloud_mask",
         normalization_stats=train_dataset.normalization_stats,
     )
 
-    mask_seq, ts_seq, target_seq, ts_time, tgt_time = train_dataset[2800]
+    vision_seq, ts_seq, target_seq, ts_time, tgt_time = train_dataset[2800]
 
-    print("Mask sequence shape:", mask_seq.shape)        # (T_img, 3, H, W)
+    print("Vision sequence shape:", vision_seq.shape)    # (T_img, 3, H, W)
     print("TS sequence shape:", ts_seq.shape)            # (T_ts, 3)
     print("Target sequence shape:", target_seq.shape)    # (20, 1)
 
@@ -419,15 +437,15 @@ if __name__ == "__main__":
     # -------------------------------
     # Visualize cloud masks
     # -------------------------------
-    T = mask_seq.shape[0]
+    T = vision_seq.shape[0]
     fig, axes = plt.subplots(1, T, figsize=(3 * T, 3))
 
     if T == 1:
         axes = [axes]
 
     for i in range(T):
-        axes[i].imshow(mask_seq[i].permute(1, 2, 0))
-        axes[i].set_title("Cloud Mask")
+        axes[i].imshow(vision_seq[i].permute(1, 2, 0).clamp(0, 1))
+        axes[i].set_title("Vision")
         axes[i].axis("off")
 
     plt.tight_layout()

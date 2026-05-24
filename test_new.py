@@ -31,14 +31,14 @@ ROOT_DIR = ""
 # -------------------------------
 # Use the same mode as the model you trained.
 #
-# "real" -> evaluate cloud-mask-only model
-# "zero" -> evaluate zero-mask baseline
-MASK_MODE = "zero"
+# "cloud_mask"     -> evaluate cloud-mask images + time-series
+# "original_image" -> evaluate original sky images + time-series
+VISION_INPUT_MODE = "cloud_mask"
 
 # Must match the folder used during training.
-# Mask only -> "runs/cloud_mask_only_target_norm"
-# Zero mask -> "runs/zero_mask_baseline_target_norm"
-OUTPUT_DIR = "runs/cloud_mask_only_target_norm"
+# Cloud mask     -> "runs/cloud_mask_time_series_target_norm"
+# Original image -> "runs/original_image_time_series_target_norm"
+OUTPUT_DIR = f"runs/{VISION_INPUT_MODE}_time_series_target_norm"
 
 # -------------------------------
 # Checkpoint to evaluate
@@ -77,12 +77,12 @@ TARGET_COLS = ["ghi"]
 NORMALIZE_TARGETS = True
 
 # -------------------------------
-# Cloud-mask image settings
+# Vision image settings
 # Must match training.
 # -------------------------------
 IMG_SIZE = 224
 
-# Mask convention:
+# Cloud-mask convention:
 # R = low cloud
 # G = mid cloud
 # B = high cloud
@@ -93,7 +93,7 @@ IMG_SIZE = 224
 # Must match training.
 # -------------------------------
 VISION_MODEL_NAME = "vit_base_patch16_224"
-MASK_IN_CHANS = 3
+VISION_IN_CHANS = 3
 
 # During evaluation we do not need to load ImageNet weights,
 # because we load your trained checkpoint.
@@ -396,7 +396,6 @@ def evaluate_split(
     model,
     loader,
     device,
-    use_cloud_mask,
     split_name,
     norm_stats=None,
     save_predictions_path=None,
@@ -419,21 +418,20 @@ def evaluate_split(
 
     with torch.no_grad():
         for batch in loop:
-            mask_seq, ts_seq, targets, ts_time, tgt_time = batch
+            vision_seq, ts_seq, targets, ts_time, tgt_time = batch
 
-            mask_seq = mask_seq.to(device, non_blocking=True)
+            vision_seq = vision_seq.to(device, non_blocking=True)
             ts_seq = ts_seq.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
-            batch_size = mask_seq.size(0)
+            batch_size = vision_seq.size(0)
 
             use_amp_now = device.type == "cuda" and USE_AMP
 
             with torch.cuda.amp.autocast(enabled=use_amp_now):
                 preds = model(
-                    cloud_mask=mask_seq,
+                    vision=vision_seq,
                     ts=ts_seq,
-                    use_cloud_mask=use_cloud_mask,
                 )
 
                 loss = criterion(preds, targets)
@@ -601,7 +599,7 @@ def build_datasets(norm_stats):
         target_cols=TARGET_COLS,
         img_size=IMG_SIZE,
         root_dir=ROOT_DIR,
-        mask_mode=MASK_MODE,
+        vision_input_mode=VISION_INPUT_MODE,
         apply_rotation=False,
         normalize_targets=NORMALIZE_TARGETS,
     )
@@ -621,7 +619,7 @@ def build_datasets(norm_stats):
         target_cols=TARGET_COLS,
         img_size=IMG_SIZE,
         root_dir=ROOT_DIR,
-        mask_mode=MASK_MODE,
+        vision_input_mode=VISION_INPUT_MODE,
         apply_rotation=False,
         normalization_stats=norm_stats,
         normalize_targets=NORMALIZE_TARGETS,
@@ -642,7 +640,7 @@ def build_datasets(norm_stats):
             target_cols=TARGET_COLS,
             img_size=IMG_SIZE,
             root_dir=ROOT_DIR,
-            mask_mode=MASK_MODE,
+            vision_input_mode=VISION_INPUT_MODE,
             apply_rotation=False,
             normalization_stats=norm_stats,
             normalize_targets=NORMALIZE_TARGETS,
@@ -663,7 +661,8 @@ def build_model(device):
         ts_feat_dim=len(FEATURE_COLS),
         img_size=IMG_SIZE,
         vision_model_name=VISION_MODEL_NAME,
-        mask_in_chans=MASK_IN_CHANS,
+        vision_in_chans=VISION_IN_CHANS,
+        vision_input_mode=VISION_INPUT_MODE,
         pretrained=PRETRAINED,
         freeze_vision=FREEZE_VISION,
         d_model=D_MODEL,
@@ -719,8 +718,6 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    use_cloud_mask = MASK_MODE == "real"
-
     print("\n==============================")
     print("Solar Irradiance Forecasting Evaluation")
     print("==============================")
@@ -730,23 +727,24 @@ def main():
     print(f"Output directory: {OUTPUT_DIR}")
     print(f"Evaluation output directory: {EVAL_OUTPUT_DIR}")
     print(f"Checkpoint path: {CHECKPOINT_PATH}")
-    print(f"Mask mode: {MASK_MODE}")
-    print(f"Use cloud-mask input: {use_cloud_mask}")
-    print(f"Cloud-mask sequence length: {IMG_SEQ_LEN}")
+    print(f"Vision input mode: {VISION_INPUT_MODE}")
+    print(f"Vision sequence length: {IMG_SEQ_LEN}")
     print(f"Time-series length: {TS_SEQ_LEN}")
     print(f"Forecast horizon: {HORIZON} minutes")
     print(f"Time-series features: {FEATURE_COLS}")
     print(f"Target columns: {TARGET_COLS}")
     print(f"Normalize targets: {NORMALIZE_TARGETS}")
     print("Ignored columns: raw_image_path, optical_flow_image_path, temp, pressure, delta_ghi")
-    print("Mask convention: R=low cloud, G=mid cloud, B=high cloud, black=sky")
+    print("Cloud-mask convention: R=low cloud, G=mid cloud, B=high cloud, black=sky")
 
-    if MASK_MODE == "real":
-        print("Experiment: CLOUD-MASK-ONLY vision input")
-    elif MASK_MODE == "zero":
-        print("Experiment: ZERO-MASK baseline")
+    if VISION_INPUT_MODE == "cloud_mask":
+        print("Experiment: CLOUD MASK + time-series")
+    elif VISION_INPUT_MODE == "original_image":
+        print("Experiment: ORIGINAL IMAGE + time-series")
     else:
-        raise ValueError("MASK_MODE must be either 'real' or 'zero'")
+        raise ValueError(
+            "VISION_INPUT_MODE must be either 'cloud_mask' or 'original_image'"
+        )
 
     # -------------------------------
     # Load normalization stats
@@ -817,8 +815,8 @@ def main():
     summary_rows = []
 
     all_results = {
-        "experiment": "cloud_mask_only" if use_cloud_mask else "zero_mask_baseline",
-        "mask_mode": MASK_MODE,
+        "experiment": f"{VISION_INPUT_MODE}_time_series",
+        "vision_input_mode": VISION_INPUT_MODE,
         "checkpoint_path": CHECKPOINT_PATH,
         "csv_path": CSV_PATH,
         "feature_cols": FEATURE_COLS,
@@ -834,7 +832,7 @@ def main():
         "img_seq_len": IMG_SEQ_LEN,
         "ts_seq_len": TS_SEQ_LEN,
         "horizon": HORIZON,
-        "mask_in_chans": MASK_IN_CHANS,
+        "vision_in_chans": VISION_IN_CHANS,
         "splits": {},
     }
 
@@ -858,7 +856,6 @@ def main():
             model=model,
             loader=loader,
             device=device,
-            use_cloud_mask=use_cloud_mask,
             split_name=split_name,
             norm_stats=norm_stats,
             save_predictions_path=prediction_path,
