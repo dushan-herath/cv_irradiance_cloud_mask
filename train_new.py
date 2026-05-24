@@ -34,7 +34,7 @@ ROOT_DIR = ""
 # -------------------------------
 # "real" -> cloud-mask-only model
 # "zero" -> same model with zero mask images for an ablation baseline
-MASK_MODE = "zero"
+MASK_MODE = "real"
 
 # Recommended output directories:
 # Mask only -> "runs/cloud_mask_only_target_norm"
@@ -77,10 +77,10 @@ IMG_SIZE = 224
 # -------------------------------
 # Model settings
 # -------------------------------
-VISION_MODEL_NAME = "vit_tiny_patch16_224"
+VISION_MODEL_NAME = "vit_base_patch16_224"
 MASK_IN_CHANS = 3
 PRETRAINED = True
-FREEZE_VISION = False
+FREEZE_VISION = True
 
 D_MODEL = 128
 FUSED_DIM = 128

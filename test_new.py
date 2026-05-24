@@ -33,7 +33,7 @@ ROOT_DIR = ""
 #
 # "real" -> evaluate cloud-mask-only model
 # "zero" -> evaluate zero-mask baseline
-MASK_MODE = "zero"
+MASK_MODE = "real"
 
 # Must match the folder used during training.
 # Mask only -> "runs/cloud_mask_only_target_norm"
@@ -92,7 +92,7 @@ IMG_SIZE = 224
 # Model settings
 # Must match training.
 # -------------------------------
-VISION_MODEL_NAME = "vit_tiny_patch16_224"
+VISION_MODEL_NAME = "vit_base_patch16_224"
 MASK_IN_CHANS = 3
 
 # During evaluation we do not need to load ImageNet weights,
