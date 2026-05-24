@@ -34,7 +34,7 @@ ROOT_DIR = ""
 # -------------------------------
 # "cloud_mask"     -> cloud-mask images + time-series
 # "original_image" -> original sky images + time-series
-VISION_INPUT_MODE = "cloud_mask"
+VISION_INPUT_MODE = "original_image"
 
 # Recommended output directories:
 # Cloud mask     -> "runs/cloud_mask_time_series_target_norm"
